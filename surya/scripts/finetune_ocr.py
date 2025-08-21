@@ -105,10 +105,14 @@ class SuryaOCRDataArguments:
 @dataclass
 class SuryaOCRTrainingArguments(TrainingArguments):
     remove_unused_columns: bool = field(default=False)
+    ddp_find_unused_parameters: bool = field(default=True)
     
 def main():
     parser = HfArgumentParser((SuryaOCRModelArguments, SuryaOCRDataArguments, SuryaOCRTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    
+    if training_args.gradient_checkpointing:
+        training_args.gradient_checkpointing_kwargs = {"use_reentrant": False}
 
     model, processor = load_model_and_processor(model_args.pretrained_checkpoint_path)
     dataset = SuryaOCRDataset(processor, data_args)

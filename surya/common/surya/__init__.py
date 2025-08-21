@@ -193,58 +193,64 @@ class SuryaModel(S3DownloaderMixin, PreTrainedModel):
         self,
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
-        encoder_chunk_size: int | None,
+        encoder_chunk_size: int | None = None,
     ):
-        # embed all images with the vision encoder after they have already been tiled and flattened into a single batch
-        chunks = [0]
-        grid_chunks = [0]
-        curr_chunk_len = 0
-        curr_seq_len = 0
-        for i in range(len(grid_thw)):
-            curr_chunk_len += (grid_thw[i][0] * grid_thw[i][1] * grid_thw[i][2]).item()
-            if curr_chunk_len > encoder_chunk_size:
-                chunks.append(curr_chunk_len + curr_seq_len)
-                curr_seq_len += curr_chunk_len
-                curr_chunk_len = 0
-                grid_chunks.append(i + 1)
-
-        if curr_chunk_len > 0:
-            chunks.append(pixel_values.shape[0])
-            grid_chunks.append(len(grid_thw))
-
-        assert curr_chunk_len + curr_seq_len == pixel_values.shape[0], (
-            f"Mismatch in encoder chunking, {curr_chunk_len} + {curr_seq_len} != {pixel_values.shape[0]}"
-        )
-
-        logger.debug(
-            f"Chunking encoder sequence into {len(chunks) - 1} chunks of size {encoder_chunk_size} with lengths {chunks} and grids {grid_chunks}"
-        )
-        embeddings = []
-        for i in range(len(chunks) - 1):
-            start = chunks[i]
-            end = chunks[i + 1]
-            grid_start = grid_chunks[i]
-            grid_end = grid_chunks[i + 1]
-            
-            chunk_pixels = pixel_values[start:end]
-            chunk_grid_thw = grid_thw[grid_start:grid_end]
-            actual_chunk_len = end - start
-            chunk_pixels, chunk_grid_thw, valid_embed_len = self.maybe_static_pad_image_inputs(chunk_pixels, chunk_grid_thw, actual_chunk_len, encoder_chunk_size)
-
-            chunk_embeddings = self.vision_encoder.embed_images(
-                image_batch=chunk_pixels,
-                grid_thw=chunk_grid_thw
+        if encoder_chunk_size is None:
+            embeddings = self.vision_encoder.embed_images(
+                image_batch=pixel_values,
+                grid_thw=grid_thw
             )
-            embeddings.append(chunk_embeddings[:valid_embed_len])
-
-        if len(embeddings) == 0:
-            raise ValueError(
-                "No image embeddings were generated. Check the input images and grid sizes."
-            )
-        elif len(embeddings) == 1:
-            embeddings = embeddings[0]
         else:
-            embeddings = torch.cat(embeddings, dim=0)
+            # embed all images with the vision encoder after they have already been tiled and flattened into a single batch
+            chunks = [0]
+            grid_chunks = [0]
+            curr_chunk_len = 0
+            curr_seq_len = 0
+            for i in range(len(grid_thw)):
+                curr_chunk_len += (grid_thw[i][0] * grid_thw[i][1] * grid_thw[i][2]).item()
+                if curr_chunk_len > encoder_chunk_size:
+                    chunks.append(curr_chunk_len + curr_seq_len)
+                    curr_seq_len += curr_chunk_len
+                    curr_chunk_len = 0
+                    grid_chunks.append(i + 1)
+
+            if curr_chunk_len > 0:
+                chunks.append(pixel_values.shape[0])
+                grid_chunks.append(len(grid_thw))
+
+            assert curr_chunk_len + curr_seq_len == pixel_values.shape[0], (
+                f"Mismatch in encoder chunking, {curr_chunk_len} + {curr_seq_len} != {pixel_values.shape[0]}"
+            )
+
+            logger.debug(
+                f"Chunking encoder sequence into {len(chunks) - 1} chunks of size {encoder_chunk_size} with lengths {chunks} and grids {grid_chunks}"
+            )
+            embeddings = []
+            for i in range(len(chunks) - 1):
+                start = chunks[i]
+                end = chunks[i + 1]
+                grid_start = grid_chunks[i]
+                grid_end = grid_chunks[i + 1]
+                
+                chunk_pixels = pixel_values[start:end]
+                chunk_grid_thw = grid_thw[grid_start:grid_end]
+                actual_chunk_len = end - start
+                chunk_pixels, chunk_grid_thw, valid_embed_len = self.maybe_static_pad_image_inputs(chunk_pixels, chunk_grid_thw, actual_chunk_len, encoder_chunk_size)
+
+                chunk_embeddings = self.vision_encoder.embed_images(
+                    image_batch=chunk_pixels,
+                    grid_thw=chunk_grid_thw
+                )
+                embeddings.append(chunk_embeddings[:valid_embed_len])
+
+            if len(embeddings) == 0:
+                raise ValueError(
+                    "No image embeddings were generated. Check the input images and grid sizes."
+                )
+            elif len(embeddings) == 1:
+                embeddings = embeddings[0]
+            else:
+                embeddings = torch.cat(embeddings, dim=0)
 
         encoding_2d = self.get_2d_learned_embeddings(
             grid_thw,
@@ -378,7 +384,7 @@ class SuryaModel(S3DownloaderMixin, PreTrainedModel):
         output_hidden_states=False,
         output_attentions=False,
         use_cache=False,
-        encoder_chunk_size=32768,
+        encoder_chunk_size=None,
         cache_idxs=None,
         num_valid_tokens=None,
         prefill=True,
