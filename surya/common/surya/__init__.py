@@ -487,13 +487,6 @@ class SuryaModel(S3DownloaderMixin, PreTrainedModel):
         if self.decoder.config._attn_implementation == "flash_attention_2":
             return attention_mask
 
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = (
-            past_key_values.get_seq_length() if past_key_values is not None else 0
-        )
-
         # We always pass in a 2D attention mask from the processor - In both static and dynamic cache cases
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
@@ -501,7 +494,7 @@ class SuryaModel(S3DownloaderMixin, PreTrainedModel):
         target_length = (
             attention_mask.shape[-1]
             if isinstance(attention_mask, torch.Tensor)
-            else past_seen_tokens + sequence_length + 1
+            else past_key_values.max_cache_len
         )
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
@@ -560,7 +553,7 @@ class SuryaModel(S3DownloaderMixin, PreTrainedModel):
             device (`torch.device`):
                 The device to plcae the 4D attention mask on.
             cache_position (`torch.Tensor`):
-                Indices depicting the position of the input sequence tokens in the sequence.
+                Indices depicting the position of the input sequence tokens in the sequence. Shape `(batch_size, sequence_length)`.
             batch_size (`torch.Tensor`):
                 Batch size.
             config (`Qwen2Config`):
@@ -579,12 +572,10 @@ class SuryaModel(S3DownloaderMixin, PreTrainedModel):
                 dtype=dtype,
                 device=device,
             )
-            diagonal_attend_mask = torch.arange(
-                target_length, device=device
-            ) > cache_position.reshape(-1, 1)
-            # NOTE - Removed sliding window handling here from original impl. since we manage it differently
-            causal_mask *= diagonal_attend_mask
-            causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
+            # Batch-aware diagonal attend mask
+            diagonal_attend_mask = torch.arange(target_length, device=device).unsqueeze(0) > cache_position.unsqueeze(-1)
+            causal_mask = causal_mask.unsqueeze(0) * diagonal_attend_mask  # (batch_size, seq_len, target_len)
+            causal_mask = causal_mask[:, None, :, :]  # (batch_size, 1, seq_len, target_len)
             if attention_mask is not None:
                 causal_mask = (
                     causal_mask.clone()
