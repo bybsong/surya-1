@@ -633,7 +633,6 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 )
 
         hidden_states = self.merger(hidden_states)
-        breakpoint()
         hidden_states = hidden_states.squeeze(0)
         return hidden_states
 
