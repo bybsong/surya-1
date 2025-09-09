@@ -154,6 +154,7 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
             .permute(0, 2, 1, 3, 4)
             .unbind(1)
         )
+        # Use the same RoPE application as SDPA to avoid any subtle differences
         if position_embeddings is None:
             logger.warning_once(
                 "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
@@ -167,16 +168,25 @@ class Qwen2_5_VLVisionFlashAttention2(nn.Module):
         else:
             cos, sin = position_embeddings
 
-        q, k = apply_rotary_pos_emb_flashatt(q, k, cos.squeeze(0), sin.squeeze(0))
+        # Align RoPE application with SDPA path for numerical parity
+        q, k = apply_rotary_pos_emb_vision(q, k, cos.squeeze(0), sin.squeeze(0))
 
+        # flash_attn_varlen_func expects [total_tokens, n_heads, head_dim]
         q = q.squeeze(0)
         k = k.squeeze(0)
         v = v.squeeze(0)
         cu_seqlens = cu_seqlens.squeeze(0)
 
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        head_dim = q.shape[-1]
         attn_output = flash_attn_varlen_func(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
         ).reshape(bsz, seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
@@ -623,6 +633,7 @@ class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
                 )
 
         hidden_states = self.merger(hidden_states)
+        breakpoint()
         hidden_states = hidden_states.squeeze(0)
         return hidden_states
 
