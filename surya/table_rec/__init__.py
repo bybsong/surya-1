@@ -2,6 +2,7 @@ from collections import defaultdict
 from typing import List
 
 from PIL import Image
+import numpy as np
 
 from surya.common.predictor import BasePredictor
 from surya.layout.schema import LayoutResult
@@ -66,13 +67,10 @@ class TableRecPredictor(BasePredictor):
         for image, image_tokens, image_polygons, image_scores in zip(
             images, predicted_tokens, predicted_polygons, scores
         ):
-            print(self.processor.decode(image_tokens, "table_structure"))
             table_rows = []
             table_cells = []
             current_row = None
             current_cell = None
-            colspan = 1
-            rowspan = 1
             row_id = -1
             cell_id = -1
             within_row_id = -1
@@ -93,28 +91,24 @@ class TableRecPredictor(BasePredictor):
 
                     row_id += 1
                     within_row_id = -1
-                    has_header = False
+                    row_has_header = False
                     current_row = TableRow(
                         row_id=row_id,
-                        is_header=has_header,
+                        is_header=row_has_header,
                         polygon=poly.tolist(),
                     )
                 elif predicted_label in ["<table-cell>", "<header-cell>"]:
                     if current_cell is not None:
-                        current_cell.colspan = colspan
-                        current_cell.rowspan = rowspan
                         table_cells.append(current_cell)
 
-                    colspan = 1
-                    rowspan = 1
+                    # Start a new cell
                     within_row_id += 1
                     cell_id += 1
                     cell_is_header = predicted_label == "<header-cell>"
                     row_has_header = row_has_header or cell_is_header
-
                     current_cell = TableCell(
-                        colspan=colspan,
-                        rowspan=rowspan,
+                        colspan=1,
+                        rowspan=1,
                         within_row_id=within_row_id,
                         row_id=row_id,
                         cell_id=cell_id,
@@ -123,8 +117,6 @@ class TableRecPredictor(BasePredictor):
                     )
                 elif predicted_label == "</table-container>":
                     if current_cell is not None:
-                        current_cell.colspan = colspan
-                        current_cell.rowspan = rowspan
                         table_cells.append(current_cell)
                 elif predicted_label in ["<table-cell-columns>", "<table-cell-rows>"]:
                     pass
@@ -133,24 +125,40 @@ class TableRecPredictor(BasePredictor):
                         previous_predicted_label == "<table-cell-columns>"
                         and current_cell is not None
                     ):
-                        current_cell.colspan = colspan
+                        current_cell.colspan = int(predicted_label)
                     elif (
                         previous_predicted_label == "<table-cell-rows>"
                         and current_cell is not None
                     ):
-                        current_cell.rowspan = rowspan
+                        current_cell.rowspan = int(predicted_label)
 
                 previous_predicted_label = predicted_label
 
             cell_columns = defaultdict(list)
+            active_rowspans = {}  # col_idx -> rows remaining
             row_id = None
-            prev_colspan = 0
             for cell in table_cells:
                 if row_id != cell.row_id:
+                    # new row → reduce lifespan of all active rowspans
                     row_id = cell.row_id
-                    prev_colspan = 0
-                cell_columns[prev_colspan].append(cell)
-                prev_colspan += cell.colspan
+                    active_rowspans = {
+                        col: span - 1 for col, span in active_rowspans.items() if span > 1
+                    }
+                    col_idx = 0
+                else:
+                    col_idx = prev_colspan
+
+                while col_idx in active_rowspans:
+                    col_idx += 1
+
+                cell_columns[col_idx].append(cell)
+                cell.col_id = col_idx
+
+                # if this cell spans multiple rows, mark those columns as blocked
+                if cell.rowspan > 1:
+                    for i in range(cell.colspan):
+                        active_rowspans[col_idx + i] = cell.rowspan
+                prev_colspan = col_idx + cell.colspan
 
             columns = []
             for col_id in sorted(cell_columns.keys()):
