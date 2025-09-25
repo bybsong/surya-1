@@ -52,7 +52,9 @@ class TableRecPredictor(BasePredictor):
                 task_names=[TaskNames.table_structure for _ in range(len(images))],
                 batch_size=batch_size,
                 max_lookahead_tokens=0,  # Do not do MTP for tables
-                tqdm_desc="Recognizing Tables"
+                tqdm_desc="Recognizing Tables",
+                max_tokens=600,
+                max_sliding_window=640,
             )
         )
 
@@ -64,6 +66,7 @@ class TableRecPredictor(BasePredictor):
         for image, image_tokens, image_polygons, image_scores in zip(
             images, predicted_tokens, predicted_polygons, scores
         ):
+            print(self.processor.decode(image_tokens, "table_structure"))
             table_rows = []
             table_cells = []
             current_row = None
