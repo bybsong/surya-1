@@ -28,7 +28,7 @@ logger = get_logger()
 def table_recognition_cli(input_path: str, skip_table_detection: bool, **kwargs):
     loader = CLILoader(input_path, kwargs, highres=True)
 
-    foundation_predictor = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
+    foundation_predictor = FoundationPredictor()
     layout_predictor = LayoutPredictor(foundation_predictor)
     table_rec_predictor = TableRecPredictor()
 

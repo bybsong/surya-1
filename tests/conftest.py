@@ -19,10 +19,15 @@ def ocr_error_predictor() -> OCRErrorPredictor:
     yield ocr_error_predictor
     del ocr_error_predictor
 
+@pytest.fixture(scope="session")
+def foundation_predictor() -> FoundationPredictor:
+    foundation_predictor = FoundationPredictor()
+    yield foundation_predictor
+    del foundation_predictor
 
 @pytest.fixture(scope="session")
-def layout_predictor() -> LayoutPredictor:
-    layout_predictor = LayoutPredictor(FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT))
+def layout_predictor(foundation_predictor) -> LayoutPredictor:
+    layout_predictor = LayoutPredictor(foundation_predictor)
     yield layout_predictor
     del layout_predictor
 
@@ -35,8 +40,8 @@ def detection_predictor() -> DetectionPredictor:
 
 
 @pytest.fixture(scope="session")
-def recognition_predictor() -> RecognitionPredictor:
-    recognition_predictor = RecognitionPredictor(FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT))
+def recognition_predictor(foundation_predictor) -> RecognitionPredictor:
+    recognition_predictor = RecognitionPredictor(foundation_predictor)
     yield recognition_predictor
     del recognition_predictor
 

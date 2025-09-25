@@ -224,7 +224,8 @@ from surya.layout import LayoutPredictor
 from surya.settings import settings
 
 image = Image.open(IMAGE_PATH)
-layout_predictor = LayoutPredictor(FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT))
+foundation_predictor = FoundationPredictor()
+layout_predictor = LayoutPredictor(foundation_predictor)
 
 # layout_predictions is a list of dicts, one per image
 layout_predictions = layout_predictor([image])

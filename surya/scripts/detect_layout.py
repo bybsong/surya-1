@@ -21,7 +21,7 @@ logger = get_logger()
 def detect_layout_cli(input_path: str, **kwargs):
     loader = CLILoader(input_path, kwargs)
 
-    foundation_predictor = FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)
+    foundation_predictor = FoundationPredictor()
     layout_predictor = LayoutPredictor(foundation_predictor)
 
     start = time.time()

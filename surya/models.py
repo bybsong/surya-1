@@ -18,10 +18,11 @@ configure_logging()
 def load_predictors(
     device: str | torch.device | None = None, dtype: torch.dtype | str | None = None
 ) -> Dict[str, BasePredictor]:
+    foundation_predictor = FoundationPredictor(device=device, dtype=dtype)
     return {
-        "layout": LayoutPredictor(FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT)),
+        "layout": LayoutPredictor(foundation_predictor),
         "ocr_error": OCRErrorPredictor(device=device, dtype=dtype),
-        "recognition": RecognitionPredictor(FoundationPredictor(checkpoint=settings.RECOGNITION_MODEL_CHECKPOINT)),
+        "recognition": RecognitionPredictor(foundation_predictor),
         "detection": DetectionPredictor(device=device, dtype=dtype),
         "table_rec": TableRecPredictor(device=device, dtype=dtype),
     }

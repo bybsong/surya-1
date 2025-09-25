@@ -74,7 +74,7 @@ class DistanceProjection(nn.Module):
         nn.init.zeros_(self.fc2.bias)
 
 
-class BboxHead(nn.Module):
+class OutputHead(nn.Module):
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
         self.proj_layers = nn.ModuleList(
@@ -144,8 +144,8 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         self.vision_encoder.config = self.config.vision_encoder
         self.decoder.config = self.config.decoder
 
-        self.bbox_head = BboxHead(config.hidden_size, 6)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
+        self.bbox_head = OutputHead(config.hidden_size, 6)
+        self.lm_head = OutputHead(config.hidden_size, config.vocab_size)
 
         if (
             self.config.multi_output_distance is not None
