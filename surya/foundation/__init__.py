@@ -319,6 +319,7 @@ class FoundationPredictor(BasePredictor):
                 prefill=False,
                 num_valid_tokens=num_valid_tokens,
                 logits_to_keep=1,
+                cache_idxs=list(range(batch_size)),
             )
 
         processed_output: ContinuousBatchOutput = self.process_outputs(

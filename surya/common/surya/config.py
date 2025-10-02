@@ -37,6 +37,7 @@ class SuryaModelConfig(S3DownloaderMixin, PretrainedConfig):
         sliding_window: Optional[int] = None,
         multi_output_distance: int = 4,
         max_multi_out: int = 8,
+        encoder_seq_len: Optional[int] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -65,6 +66,7 @@ class SuryaModelConfig(S3DownloaderMixin, PretrainedConfig):
         self.sliding_window = sliding_window
         self.multi_output_distance = multi_output_distance
         self.max_multi_out = max_multi_out
+        self.encoder_seq_len = encoder_seq_len
 
         if self.sliding_window is None:
             self.sliding_window = self.max_sequence_length

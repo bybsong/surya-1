@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, TypedDict
+from typing import List, Optional, Tuple, TypedDict
 import warnings
 from dataclasses import dataclass
 
@@ -108,6 +108,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         self.vision_encoder = vision_encoder
         self.decoder = decoder
         self.embedder = embedder
+        self.encoder_seq_len = getattr(config, "encoder_seq_len", None)
 
         # Simple encoding for image patches
         self.img_w_embed = nn.Embedding(
@@ -159,6 +160,83 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
     def set_input_embeddings(self, new_embeddings: nn.Module):
         self.embedder.token_embed = new_embeddings
 
+    def _unpack_image_embeddings_with_mask(
+        self,
+        image_embeds_flat: torch.Tensor,
+        grid_thw: torch.Tensor,
+        decoder_seq_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Unpacks image_embeds into batch-major form and constructs an additive attention mask.
+
+        Args:
+            image_embeds_flat: Tensor of shape (total_seq_len, embed_dim)
+            grid_thw: Tensor of shape (batch_size, 3) with grid dimensions
+            decoder_seq_len: Length of decoder sequence
+
+        Returns:
+            batched_image_embeds: Tensor of shape (batch_size, max_seq_len, embed_dim)
+            attention_mask: Tensor of shape (batch_size, 1, decoder_seq_len, max_seq_len)
+                            with 0 for valid tokens and -inf for padding (for additive attention)
+            seq_lengths: Tensor of shape (batch_size,) containing the valid encoder lengths
+        """
+        device = image_embeds_flat.device
+        dtype = image_embeds_flat.dtype
+
+        batch_size = grid_thw.shape[0]
+        total_seq_len, embed_dim = image_embeds_flat.shape
+
+        # Calculate sequence lengths for each batch item
+        seq_lengths = grid_thw.prod(dim=-1) // (
+            self.vision_encoder.spatial_merge_size**2
+        )
+        max_seq_len = seq_lengths.max().item()
+        target_seq_len = max_seq_len
+        if self.encoder_seq_len is not None:
+            if max_seq_len > self.encoder_seq_len:
+                raise ValueError(
+                    "encoder_seq_len was set too low; increase it to fit image embeddings"
+                )
+            target_seq_len = self.encoder_seq_len
+
+        # Build indices for scatter operation
+        batch_indices = []
+        position_indices = []
+
+        for i, seq_len in enumerate(seq_lengths):
+            batch_indices.extend([i] * seq_len)
+            position_indices.extend(list(range(seq_len)))
+
+        batch_indices = torch.tensor(batch_indices, device=device, dtype=torch.long)
+        position_indices = torch.tensor(
+            position_indices, device=device, dtype=torch.long
+        )
+
+        # Create batched embeddings tensor
+        batched_image_embeds = torch.zeros(
+            (batch_size, target_seq_len, embed_dim), device=device, dtype=dtype
+        )
+
+        # Create additive attention mask: shape (batch_size, decoder_seq_len, max_seq_len)
+        # - Rows = queries (from decoder), Columns = keys (from encoder)
+        # - -inf for padding, 0 for valid positions
+        attention_mask = torch.full(
+            (batch_size, decoder_seq_len, target_seq_len),
+            fill_value=float('-inf'),
+            device=device,
+            dtype=dtype,
+        )
+        for b in range(batch_size):
+            valid_len = seq_lengths[b].item()
+            attention_mask[b, :, :valid_len] = 0  # Unmasked
+
+        attention_mask = attention_mask.unsqueeze(1)  # (batch_size, 1, decoder_seq_len, max_seq_len)
+
+        # Scatter flat embeddings into batched form
+        batched_image_embeds[batch_indices, position_indices] = image_embeds_flat
+
+        return batched_image_embeds, attention_mask, seq_lengths
+
     def maybe_static_pad_image_inputs(
         self,
         chunk_pixels: torch.Tensor,
@@ -193,7 +271,12 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
         encoder_chunk_size: int | None,
+        decoder_seq_len: int,
     ):
+        """
+        Embed images and return batched embeddings with cross-attention mask.
+        For cross-attention: returns (batch_size, max_tokens, hidden_size) and mask.
+        """
         # embed all images with the vision encoder after they have already been tiled and flattened into a single batch
         chunks = [0]
         grid_chunks = [0]
@@ -262,43 +345,238 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
 
         embeddings = embeddings + encoding_2d
 
-        return embeddings
+        # For cross-attention: batch the flat embeddings and create attention mask
+        (
+            batched_embeddings,
+            attention_mask,
+            seq_lengths,
+        ) = self._unpack_image_embeddings_with_mask(
+            image_embeds_flat=embeddings,
+            grid_thw=grid_thw,
+            decoder_seq_len=decoder_seq_len,
+        )
+        attention_mask = attention_mask.to(dtype=embeddings.dtype)
+
+        return batched_embeddings, attention_mask, seq_lengths
 
     def embed_ids_boxes_images(
         self, input_ids, pixel_values, grid_thw, encoder_chunk_size: int
     ):
         """
-        Insert embedded image tiles into the corresponding positions into the full input sequence
-
-        Positions to insert new tokens are indicated by the special image token index
+        For cross-attention model: embed input tokens and separately prepare image features
+        for encoder embeddings (NOT inserted into the sequence)
         """
         # This is batched in the inner call
         inputs_embeds = self.embedder.embed(input_tokens=input_ids)
+        encoder_embeddings = None
+        encoder_attention_mask = None
+        encoder_seq_lengths: Optional[torch.Tensor] = None
+
+        # Assert no image tokens in the sequence (cross-attention model)
+        assert (input_ids == self.config.image_token_id).sum() == 0, (
+            "This is a cross-attention model. There should be no image token ids in the sequence!"
+        )
+
         if pixel_values is not None:
-            image_features = self.get_image_embeddings(
+            # get_image_embeddings now returns batched embeddings and mask
+            (
+                encoder_embeddings,
+                encoder_attention_mask,
+                encoder_seq_lengths,
+            ) = self.get_image_embeddings(
                 pixel_values=pixel_values,
                 grid_thw=grid_thw,
                 encoder_chunk_size=encoder_chunk_size,
+                decoder_seq_len=input_ids.shape[1],
             )
-
-            special_image_mask = (input_ids == self.config.image_token_id).unsqueeze(-1)
-            special_image_mask = special_image_mask.expand_as(inputs_embeds)
-            if inputs_embeds[special_image_mask].numel() != image_features.numel():
-                n_image_tokens = torch.sum((input_ids == self.config.image_token_id))
-                n_image_features = image_features.shape[0] * image_features.shape[1]
-                warnings.warn(
-                    f"Image features and image tokens do not match: tokens {n_image_tokens}, features {n_image_features}. This may lead to unexpected results"
+            encoder_embeddings = encoder_embeddings.to(inputs_embeds.dtype)
+            if encoder_attention_mask is not None:
+                encoder_attention_mask = encoder_attention_mask.to(
+                    dtype=inputs_embeds.dtype
                 )
-            image_features = image_features.to(inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(
-                special_image_mask, image_features
+
+        return (
+            inputs_embeds,
+            encoder_embeddings,
+            encoder_attention_mask,
+            encoder_seq_lengths,
+        )
+
+    def _build_encoder_attention_inputs(
+        self,
+        image_features: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        if image_features is None or image_features.numel() == 0:
+            return None, None
+
+        batch_size = input_ids.size(0)
+        hidden_size = image_features.size(-1)
+        token_counts = (input_ids == self.config.image_token_id).sum(dim=1)
+        max_tokens = token_counts.max().item() if token_counts.numel() > 0 else 0
+
+        if max_tokens == 0:
+            return None, None
+
+        total_tokens = token_counts.sum().item()
+        if total_tokens != image_features.shape[0]:
+            logger.warning(
+                "Mismatch between image features and token counts while building cross-attention inputs"
+            )
+            return None, None
+
+        encoder_embeddings = image_features.new_zeros((batch_size, max_tokens, hidden_size))
+
+        offset = 0
+        for batch_idx in range(batch_size):
+            count = int(token_counts[batch_idx].item())
+            if count == 0:
+                continue
+            next_offset = offset + count
+            encoder_embeddings[batch_idx, :count] = image_features[offset:next_offset]
+            offset = next_offset
+
+        return encoder_embeddings, token_counts
+
+    def _build_cross_attention_mask(
+        self,
+        encoder_embeddings: torch.Tensor,
+        decoder_seq_len: int,
+        encoder_seq_lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Build cross-attention mask for encoder-decoder attention, masking padded encoder tokens.
+
+        Args:
+            encoder_embeddings: shape (batch_size, encoder_len, hidden_size)
+            decoder_seq_len: length of decoder sequence (1 during generation)
+            encoder_seq_lengths: optional tensor of shape (batch_size,) with valid encoder lengths
+
+        Returns:
+            attention_mask: shape (batch_size, 1, decoder_seq_len, encoder_len)
+                            with 0 for valid tokens and -inf for padding positions
+        """
+        batch_size, encoder_len, _ = encoder_embeddings.shape
+        device = encoder_embeddings.device
+        dtype = encoder_embeddings.dtype
+
+        if encoder_seq_lengths is None:
+            encoder_seq_lengths = torch.full(
+                (batch_size,),
+                fill_value=encoder_len,
+                device=device,
+                dtype=torch.long,
             )
         else:
-            assert (input_ids == self.config.image_token_id).sum() == 0, (
-                "Image tokens were present in the input but no input images were provided"
+            encoder_seq_lengths = encoder_seq_lengths.to(
+                device=device, dtype=torch.long
             )
 
-        return inputs_embeds
+        attention_mask = torch.full(
+            (batch_size, decoder_seq_len, encoder_len),
+            fill_value=float('-inf'),
+            device=device,
+            dtype=dtype,
+        )
+        for b in range(batch_size):
+            valid_len = int(encoder_seq_lengths[b].item())
+            if valid_len > 0:
+                attention_mask[b, :, :valid_len] = 0.0
+
+        return attention_mask.unsqueeze(1)
+
+    def _get_cached_encoder_states(
+        self,
+        past_key_values,
+        cache_idxs: Optional[List[int]],
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Retrieve cached encoder embeddings and valid lengths."""
+        if past_key_values is None or cache_idxs is None:
+            return None
+
+        storage = getattr(past_key_values, "_encoder_states", None)
+        if not storage:
+            return None
+
+        embeddings_list: List[Optional[torch.Tensor]] = []
+        lengths: List[int] = []
+        first_emb = None
+        max_tokens = 0
+
+        for cache_idx in cache_idxs:
+            entry = storage.get(cache_idx)
+            if entry is None:
+                embeddings_list.append(None)
+                lengths.append(0)
+                continue
+
+            if isinstance(entry, tuple):
+                emb, valid_len = entry
+            else:  # Backward compatibility with older cache format
+                emb = entry
+                valid_len = emb.shape[0]
+            embeddings_list.append(emb)
+            lengths.append(int(valid_len))
+            if first_emb is None:
+                first_emb = emb
+            max_tokens = max(max_tokens, emb.shape[0])
+
+        if first_emb is None:
+            return None
+
+        # Stack embeddings
+        batch_size = len(cache_idxs)
+        hidden_size = first_emb.shape[-1]
+        device = first_emb.device
+        dtype = first_emb.dtype
+
+        stacked_embeddings = torch.zeros(
+            (batch_size, max_tokens, hidden_size), device=device, dtype=dtype
+        )
+
+        for batch_idx, emb in enumerate(embeddings_list):
+            if emb is None:
+                continue
+            stacked_embeddings[batch_idx, :emb.shape[0]] = emb
+        lengths_tensor = torch.tensor(lengths, device=device, dtype=torch.long)
+
+        return stacked_embeddings, lengths_tensor
+
+    def _set_cached_encoder_states(
+        self,
+        past_key_values,
+        cache_idxs: Optional[List[int]],
+        encoder_embeddings: torch.Tensor | None,
+        encoder_seq_lengths: Optional[torch.Tensor],
+    ) -> None:
+        """Store encoder embeddings and valid lengths in cache for reuse during decoding."""
+        if past_key_values is None or cache_idxs is None:
+            return
+
+        if not hasattr(past_key_values, "_encoder_states"):
+            past_key_values._encoder_states = {}
+
+        storage = past_key_values._encoder_states
+
+        if encoder_embeddings is None or encoder_seq_lengths is None:
+            for cache_idx in cache_idxs:
+                storage.pop(cache_idx, None)
+            return
+
+        batch_size = encoder_embeddings.shape[0]
+        limit = min(len(cache_idxs), batch_size)
+
+        for local_idx in range(limit):
+            cache_idx = cache_idxs[local_idx]
+            valid_len = int(encoder_seq_lengths[local_idx].item())
+            if valid_len <= 0:
+                storage[cache_idx] = None
+                continue
+            emb = encoder_embeddings[local_idx, :valid_len].detach().clone()
+            storage[cache_idx] = (emb, valid_len)
+
+        for cache_idx in cache_idxs[limit:]:
+            storage.pop(cache_idx, None)
 
     def get_2d_learned_embeddings(
         self,
@@ -387,6 +665,8 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         num_valid_tokens=None,
         prefill=True,
         text_lengths=None,
+        encoder_embeddings=None,
+        encoder_attention_mask=None,
         logits_to_keep=None,
         **kwargs: KwargsForCausalLM,
     ):
@@ -403,9 +683,56 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
                 "`input_ids`, `position_ids`, and `cache_position` **must** be specified. `image_tiles` and `grid_thw` are required for prefill"
             )
 
-        inputs_embeds = self.embed_ids_boxes_images(
+        (
+            inputs_embeds,
+            computed_encoder_embeddings,
+            computed_encoder_attention_mask,
+            computed_encoder_seq_lengths,
+        ) = self.embed_ids_boxes_images(
             input_ids, image_tiles, grid_thw, encoder_chunk_size
         )
+
+        encoder_seq_lengths = computed_encoder_seq_lengths
+
+        # Use computed values if not provided
+        if encoder_embeddings is None and computed_encoder_embeddings is not None:
+            encoder_embeddings = computed_encoder_embeddings
+        if encoder_attention_mask is None and computed_encoder_attention_mask is not None:
+            encoder_attention_mask = computed_encoder_attention_mask
+        if encoder_seq_lengths is None and computed_encoder_seq_lengths is not None:
+            encoder_seq_lengths = computed_encoder_seq_lengths
+
+        # Check cache for encoder states (for generation with KV cache)
+        if encoder_embeddings is None and cache_idxs is not None:
+            cached_encoder_state = self._get_cached_encoder_states(
+                past_key_values, cache_idxs
+            )
+            if cached_encoder_state is not None:
+                cached_embeddings, cached_lengths = cached_encoder_state
+                encoder_embeddings = cached_embeddings
+                encoder_seq_lengths = cached_lengths
+
+        # Cache encoder embeddings for future use
+        if computed_encoder_embeddings is not None:
+            self._set_cached_encoder_states(
+                past_key_values,
+                cache_idxs,
+                computed_encoder_embeddings,
+                computed_encoder_seq_lengths,
+            )
+
+        # Build cross-attention mask with current decoder sequence length
+        # This ensures mask shape matches during both prefill and generation
+        if encoder_embeddings is not None and encoder_attention_mask is None:
+            current_decoder_len = inputs_embeds.shape[1]
+            encoder_attention_mask = self._build_cross_attention_mask(
+                encoder_embeddings, current_decoder_len, encoder_seq_lengths
+            )
+        if (
+            encoder_attention_mask is not None
+            and encoder_attention_mask.dtype != inputs_embeds.dtype
+        ):
+            encoder_attention_mask = encoder_attention_mask.to(inputs_embeds.dtype)
 
         # Handling flash attention kwargs outside the decoder to speed up + avoid graph breaks inside the decoder
         # Skipped during decoding since not required
@@ -438,6 +765,8 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
             position_ids=position_ids,
             cache_position=cache_position,
             past_key_values=past_key_values,
+            encoder_embeddings=encoder_embeddings,
+            encoder_attention_mask=encoder_attention_mask,
             return_dict=True,
             use_cache=use_cache,
             cache_idxs=cache_idxs,

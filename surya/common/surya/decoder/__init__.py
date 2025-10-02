@@ -71,7 +71,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    if k is not None:
+        k_embed = (k * cos) + (rotate_half(k) * sin)
+    else:
+        k_embed = None
     return q_embed, k_embed
 
 
@@ -243,6 +246,83 @@ class Qwen2Attention(nn.Module):
         return attn_output, attn_weights
 
 
+class Qwen2CrossAttention(nn.Module):
+    def __init__(self, config: SuryaDecoderConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
+        self.scaling = self.head_dim**-0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = False
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=True
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        **kwargs: Unpack[FlashAttentionKwargs],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        encoder_input_shape = encoder_hidden_states.shape[:-1]
+        encoder_hidden_shape = (*encoder_input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(encoder_hidden_states).view(encoder_hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(encoder_hidden_states).view(encoder_hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, _ = apply_rotary_pos_emb(query_states, None, cos, sin)
+
+        if (
+            attention_mask is not None
+            and attention_mask.shape[-2] != query_states.shape[-2]
+        ):
+            attention_mask = attention_mask[..., : query_states.shape[-2], :]
+
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get("sdpa")
+        if attention_interface is None:
+            raise RuntimeError(
+                "Scaled-dot product attention backend not available for cross attention"
+            )
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=None,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 class Qwen2RMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -268,7 +348,11 @@ class Qwen2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen2Attention(config=config, layer_idx=layer_idx)
+        self.cross_attn = Qwen2CrossAttention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen2MLP(config)
+        self.cross_attention_layernorm = Qwen2RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -290,17 +374,29 @@ class Qwen2DecoderLayer(nn.Module):
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
         ] = None,  # necessary, but kept here for BC
+        encoder_embeddings: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[
         torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
+        if encoder_embeddings is not None:
+            residual = hidden_states
+            norm_hidden_states = self.cross_attention_layernorm(hidden_states)
+            cross_attn_output, _ = self.cross_attn(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=encoder_embeddings,
+                attention_mask=encoder_attention_mask,
+                position_embeddings=position_embeddings,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+            hidden_states = residual + cross_attn_output
+
         residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
+        norm_hidden_states = self.input_layernorm(hidden_states)
         hidden_states, self_attn_weights = self.self_attn(
-            hidden_states=hidden_states,
+            hidden_states=norm_hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
@@ -316,10 +412,9 @@ class Qwen2DecoderLayer(nn.Module):
         )
         hidden_states = residual + hidden_states
 
-        # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        norm_hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(norm_hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -466,6 +561,8 @@ class SuryaDecoderModel(Qwen2PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        encoder_embeddings: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -510,6 +607,8 @@ class SuryaDecoderModel(Qwen2PreTrainedModel):
                 use_cache=use_cache,
                 cache_position=cache_position,
                 position_embeddings=position_embeddings,
+                encoder_embeddings=encoder_embeddings,
+                encoder_attention_mask=encoder_attention_mask,
                 cache_idxs=cache_idxs,
                 num_valid_tokens=num_valid_tokens,
                 prefill=prefill,

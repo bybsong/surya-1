@@ -254,7 +254,8 @@ class SuryaOCRProcessor(S3DownloaderMixin, ProcessorMixin):
             f"Expected number of tokens to be an integer, got {num_tokens}"
         )
 
-        input_ids = [self.image_token_id] * int(num_tokens)
+        # For cross-attention: don't add image tokens to input sequence
+        input_ids = []
         input_ids += self.register_token_ids[: self.num_register_tokens]
 
         # Handle the image being rotated in the imdataset
