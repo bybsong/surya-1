@@ -23,6 +23,8 @@ from surya.foundation.util import (
 from surya.common.surya.schema import TaskNames
 from surya.foundation.cache import (
     ContinuousBatchingCache,
+    KVCache,
+    EncoderOnlyCache,
 )
 from surya.settings import settings
 from surya.logging import get_logger, configure_logging
@@ -132,14 +134,19 @@ class FoundationPredictor(BasePredictor):
         return chunk_size
 
     def setup_cache(self, batch_size: int, max_cache_len: int, max_sliding_window: int):
-        self.kv_cache = ContinuousBatchingCache(
-            self.model.config,
-            batch_size,
-            max_cache_len,
-            text_sliding_window=max_sliding_window,
-            device=self.model.device,
-            dtype=self.model.dtype,
-        )
+        head_dim = self.model.config.hidden_size // self.model.config.num_attention_heads
+        with torch.device(self.model.device):
+            for layer in self.model.decoder.layers:
+                layer.self_attn.kv_cache = KVCache(
+                    batch_size,
+                    max_cache_len,
+                    self.model.config.num_key_value_heads,
+                    head_dim,
+                )
+
+        # Separate encoder cache used by SuryaModel to store/reuse encoder states
+        self.encoder_cache = EncoderOnlyCache(max_cache_len=max_cache_len)
+
         self.prompt_queue.clear()
         self.batch_prompt_mapping = {i: None for i in range(batch_size)}
 
@@ -300,26 +307,22 @@ class FoundationPredictor(BasePredictor):
         num_valid_tokens = current_inputs.num_valid_tokens
         batch_size = input_ids.shape[0]
 
-        # Pre-shift the attention mask based on the cache update
-        self.kv_cache.decode_attention_mask_update(
-            num_valid_tokens=num_valid_tokens, cache_idxs=list(range(batch_size))
-        )
 
-        cache_position = self.get_cache_position(
-            input_ids.shape[1], self.kv_cache.attention_mask, prefill=False
-        )
+        cache_position = position_ids
+        attention_mask = torch.ones((batch_size, cache_position[0] + 1), device=input_ids.device)
         with settings.INFERENCE_MODE():
             outputs = self.model(
                 input_ids=input_ids,
-                attention_mask=self.kv_cache.attention_mask,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 cache_position=cache_position,
                 use_cache=True,
-                past_key_values=self.kv_cache,
+                past_key_values=None,
                 prefill=False,
                 num_valid_tokens=num_valid_tokens,
                 logits_to_keep=1,
                 cache_idxs=list(range(batch_size)),
+                encoder_cache=self.encoder_cache,
             )
 
         processed_output: ContinuousBatchOutput = self.process_outputs(
@@ -345,9 +348,9 @@ class FoundationPredictor(BasePredictor):
 
         num_predicted_tokens += num_new_tokens
 
-        input_ids, num_valid_tokens = self.maybe_insert_beacon_tokens(
-            input_ids, num_predicted_tokens, num_new_tokens
-        )
+        # input_ids, num_valid_tokens = self.maybe_insert_beacon_tokens(
+        #     input_ids, num_predicted_tokens, num_new_tokens
+        # )
         position_ids = position_ids[:, -1:] + torch.arange(
             1, input_ids.shape[1] + 1, device=input_ids.device
         )
@@ -460,16 +463,7 @@ class FoundationPredictor(BasePredictor):
         position_ids = processed_inputs["position_ids"].to(dtype=torch.long)
         valid_batch_size = len(idxs_to_merge)
 
-        if settings.FOUNDATION_STATIC_CACHE:
-            input_ids = self.pad_to_batch_size(
-                input_ids, batch_size=self.kv_cache.max_batch_size
-            )
-            attention_mask = self.pad_to_batch_size(
-                attention_mask, batch_size=self.kv_cache.max_batch_size
-            )
-            position_ids = self.pad_to_batch_size(
-                position_ids, batch_size=self.kv_cache.max_batch_size
-            )
+        # No static-cache padding needed with separate encoder cache and per-layer KV caches
 
         # Find text lengths of each
         is_special = (input_ids.unsqueeze(-1) == self.special_token_ids).any(
@@ -497,7 +491,7 @@ class FoundationPredictor(BasePredictor):
                 position_ids=position_ids,
                 cache_position=cache_position,
                 inputs_embeds=None,
-                past_key_values=self.kv_cache,
+                past_key_values=None,
                 use_cache=True,
                 encoder_chunk_size=self.get_encoder_chunk_size(),
                 cache_idxs=idxs_to_merge,
@@ -505,6 +499,7 @@ class FoundationPredictor(BasePredictor):
                 num_valid_tokens=None,  # Not required during prefill
                 text_lengths=text_lengths,
                 logits_to_keep=1,
+                encoder_cache=self.encoder_cache,
             )
 
         # Process outputs
@@ -523,11 +518,6 @@ class FoundationPredictor(BasePredictor):
             )
             * predicted_tokens
         )
-
-        self.kv_cache.prefill_attention_mask_update(
-            attention_mask, idxs_to_merge, text_lengths[:valid_batch_size]
-        )
-        self.kv_cache.update_text_counts(idxs_to_merge, text_lengths[:valid_batch_size])
 
         if current_inputs is None:
             new_seq_len = processed_outputs.input_ids.shape[1]
@@ -578,49 +568,6 @@ class FoundationPredictor(BasePredictor):
 
         return new_input, processed_outputs, idxs_to_merge
 
-    def get_max_image_token_count(
-        self, images: list[np.ndarray], tasks: List[TaskNames]
-    ) -> int:
-        def compute_scaled_size(
-            H: int, W: int, max_size: Tuple[int, int]
-        ) -> Tuple[int, int]:
-            max_W, max_H = max_size
-            min_W, min_H = (168, 168)
-
-            current_pixels = H * W
-            max_pixels = max_H * max_W
-            min_pixels = min_H * min_W
-
-            if current_pixels > max_pixels:
-                scale = (max_pixels / current_pixels) ** 0.5
-                return math.floor(H * scale), math.floor(W * scale)
-            elif current_pixels < min_pixels:
-                scale = (min_pixels / current_pixels) ** 0.5
-                return math.ceil(H * scale), math.ceil(W * scale)
-            return H, W
-
-        def get_tile_count(H: int, W: int, factor: int) -> int:
-            H_bar = math.ceil(H / factor) * factor
-            W_bar = math.ceil(W / factor) * factor
-            grid_h = H_bar / self.processor.patch_size
-            grid_w = W_bar // self.processor.patch_size
-            return grid_h * grid_w
-
-        max_tokens = 0
-        factor = self.processor.patch_size * self.processor.merge_size
-
-        for image, task in zip(images, tasks):
-            H, W = image.shape[:2]
-            max_size = self.tasks[task]["img_size"]
-            scaled_H, scaled_W = compute_scaled_size(H, W, max_size)
-            token_count = get_tile_count(scaled_H, scaled_W, factor) / (
-                self.processor.merge_size**2
-            )
-            max_tokens = max(max_tokens, token_count)
-
-        # Extra 10 to account for EOS/BOS/Rotation token etc.
-        return 10 + self.processor.num_register_tokens + int(max_tokens)
-
     def prediction_loop(
         self,
         images: List[np.ndarray],
@@ -649,12 +596,11 @@ class FoundationPredictor(BasePredictor):
         batch_size = min(len(images), batch_size)
         current_inputs = None
 
-        max_image_tokens = self.get_max_image_token_count(images, task_names)
         if max_sliding_window is None:
             max_sliding_window = self.model.config.sliding_window
         self.setup_cache(
             batch_size,
-            max_cache_len=max_image_tokens + max_sliding_window,
+            max_cache_len=max_sliding_window,
             max_sliding_window=max_sliding_window,
         )
 
@@ -806,8 +752,8 @@ class FoundationPredictor(BasePredictor):
             mark_step()
         pbar.close()
 
-        del self.kv_cache
-        self.kv_cache = None
+        for layer in self.model.decoder.layers:
+            layer.self_attn.kv_cache = None
         torch.cuda.empty_cache()
 
         return predicted_tokens, batch_bboxes, scores, topk_probs

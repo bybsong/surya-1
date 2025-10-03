@@ -2,6 +2,7 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import (
@@ -102,6 +103,7 @@ def eager_attention_forward(
     dropout: float = 0.0,
     **kwargs,
 ):
+    # Deprecated path, kept for compatibility. Prefer SDPA below.
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
 
@@ -110,12 +112,8 @@ def eager_attention_forward(
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
-        query.dtype
-    )
-    attn_weights = nn.functional.dropout(
-        attn_weights, p=dropout, training=module.training
-    )
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -150,6 +148,7 @@ class Qwen2Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
         )
+        self.kv_cache = None
 
     def forward(
         self,
@@ -176,20 +175,9 @@ class Qwen2Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            # cache_idxs, num_valid_tokens, and prefill add support for our new caching mechanism
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position,
-                "cache_idxs": cache_idxs,
-                "num_valid_tokens": num_valid_tokens,
-                "prefill": prefill,
-                "text_lengths": text_lengths,
-            }
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
+        if self.kv_cache is not None:
+            key_states, value_states = self.kv_cache.update(
+                cache_position, key_states, value_states
             )
 
         attention_interface: Callable = eager_attention_forward
@@ -201,17 +189,17 @@ class Qwen2Attention(nn.Module):
                     "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
                     'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
                 )
-            elif self.config._attn_implementation == "flash_attention_2":
-                # Needed for CPU -> GPU
-                from surya.common.surya.flash_attn_utils import (
-                    flash_attn_decode,
-                    flash_attn_prefill,
-                )
+            # elif self.config._attn_implementation == "flash_attention_2":
+            #     # Needed for CPU -> GPU
+            #     from surya.common.surya.flash_attn_utils import (
+            #         flash_attn_decode,
+            #         flash_attn_prefill,
+            #     )
 
-                if prefill:
-                    attention_interface = flash_attn_prefill
-                else:
-                    attention_interface = flash_attn_decode
+            #     if prefill:
+            #         attention_interface = flash_attn_prefill
+            #     else:
+            #         attention_interface = flash_attn_decode
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[
                     self.config._attn_implementation
@@ -238,7 +226,7 @@ class Qwen2Attention(nn.Module):
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
             sliding_window=sliding_window,  # main diff with Llama
-            **kwargs,
+            # **kwargs,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()

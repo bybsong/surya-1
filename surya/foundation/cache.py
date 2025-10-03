@@ -1,6 +1,50 @@
+import torch.nn as nn
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
+
+
+class EncoderOnlyCache:
+    """Lightweight container to persist encoder embeddings across steps.
+
+    Stores per-slot encoder embeddings and valid lengths in a dict keyed by
+    `cache_idx`. SuryaModel._get/_set_cached_encoder_states read/write
+    `._encoder_states` on this object.
+
+    `max_cache_len` is optional and only used by attention helpers when no
+    2D attention mask is provided.
+    """
+
+    def __init__(self, max_cache_len: Optional[int] = None):
+        self._encoder_states: Dict[int, Tuple[torch.Tensor, int]] = {}
+        self.max_cache_len: Optional[int] = max_cache_len
+
+
+
+class KVCache(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+        super().__init__()
+        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+
+    def update(self, input_pos: torch.LongTensor, k_val: torch.Tensor, v_val: torch.Tensor):
+        # input_pos: [B, S], k_val/v_val: [B, H, S, D]
+        assert input_pos.ndim == 2, f"expected [B,S], got {tuple(input_pos.shape)}"
+        B, H, S, D = k_val.shape
+        assert self.k_cache.shape[:2] == (B, H), "batch/head mismatch"
+        assert self.k_cache.shape[-1] == D, "head_dim mismatch"
+
+        # Build per-batch index for scatter on dim=2 (sequence length)
+        # index must match src shape and be long
+        index = input_pos.unsqueeze(1).unsqueeze(-1).expand(B, H, S, D).to(torch.long)
+
+        # In-place scatter; writes k_val/v_val at positions in input_pos for each (b,h)
+        self.k_cache.scatter_(dim=2, index=index, src=k_val)
+        self.v_cache.scatter_(dim=2, index=index, src=v_val)
+
+        return self.k_cache, self.v_cache
+
 
 """
 Special cache class for the surya foundation model that supports - 
@@ -11,7 +55,6 @@ Special cache class for the surya foundation model that supports -
 
 Heavily inspired from https://github.com/huggingface/transformers/blob/0725cd6953803b8aacfc85288cbfb83dea30c469/src/transformers/cache_utils.py#L1079
 """
-
 
 class ContinuousBatchingCache():
     def __init__(

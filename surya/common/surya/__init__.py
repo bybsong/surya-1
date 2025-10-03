@@ -668,6 +668,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         encoder_embeddings=None,
         encoder_attention_mask=None,
         logits_to_keep=None,
+        encoder_cache=None,
         **kwargs: KwargsForCausalLM,
     ):
         # Process the mixed batch if provided
@@ -705,7 +706,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         # Check cache for encoder states (for generation with KV cache)
         if encoder_embeddings is None and cache_idxs is not None:
             cached_encoder_state = self._get_cached_encoder_states(
-                past_key_values, cache_idxs
+                encoder_cache, cache_idxs
             )
             if cached_encoder_state is not None:
                 cached_embeddings, cached_lengths = cached_encoder_state
@@ -715,7 +716,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         # Cache encoder embeddings for future use
         if computed_encoder_embeddings is not None:
             self._set_cached_encoder_states(
-                past_key_values,
+                encoder_cache,
                 cache_idxs,
                 computed_encoder_embeddings,
                 computed_encoder_seq_lengths,
