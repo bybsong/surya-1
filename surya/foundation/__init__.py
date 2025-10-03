@@ -146,6 +146,7 @@ class FoundationPredictor(BasePredictor):
 
         # Separate encoder cache used by SuryaModel to store/reuse encoder states
         self.encoder_cache = EncoderOnlyCache(max_cache_len=max_cache_len)
+        self.max_cache_len = max_cache_len
 
         self.prompt_queue.clear()
         self.batch_prompt_mapping = {i: None for i in range(batch_size)}
@@ -323,6 +324,7 @@ class FoundationPredictor(BasePredictor):
                 logits_to_keep=1,
                 cache_idxs=list(range(batch_size)),
                 encoder_cache=self.encoder_cache,
+                max_cache_len=self.max_cache_len,
             )
 
         processed_output: ContinuousBatchOutput = self.process_outputs(
@@ -500,6 +502,7 @@ class FoundationPredictor(BasePredictor):
                 text_lengths=text_lengths,
                 logits_to_keep=1,
                 encoder_cache=self.encoder_cache,
+                max_cache_len=self.max_cache_len,
             )
 
         # Process outputs

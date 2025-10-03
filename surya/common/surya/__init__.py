@@ -669,6 +669,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         encoder_attention_mask=None,
         logits_to_keep=None,
         encoder_cache=None,
+        max_cache_len=None,
         **kwargs: KwargsForCausalLM,
     ):
         # Process the mixed batch if provided
@@ -757,6 +758,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
             cache_position,
             past_key_values,
             output_attentions,
+            target_length=max_cache_len,
         )
 
         attention_mask = causal_mask
@@ -811,19 +813,20 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         cache_position: torch.Tensor,
         past_key_values: Cache,
         output_attentions: bool,
+        target_length: int,
     ):
-        if self.decoder.config._attn_implementation == "flash_attention_2":
-            return attention_mask
+        # if self.decoder.config._attn_implementation == "flash_attention_2":
+        #     return attention_mask
 
         # We always pass in a 2D attention mask from the processor - In both static and dynamic cache cases
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
-        target_length = (
-            attention_mask.shape[-1]
-            if isinstance(attention_mask, torch.Tensor)
-            else past_key_values.max_cache_len
-        )
+        # target_length = (
+        #     attention_mask.shape[-1]
+        #     if isinstance(attention_mask, torch.Tensor)
+        #     else past_key_values.max_cache_len
+        # )
 
         # In case the provided `attention` mask is 2D, we generate a causal mask here (4D).
         causal_mask = self._prepare_4d_causal_attention_mask_with_cache_position(

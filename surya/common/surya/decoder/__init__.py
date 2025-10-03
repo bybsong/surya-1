@@ -180,54 +180,19 @@ class Qwen2Attention(nn.Module):
                 cache_position, key_states, value_states
             )
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get(
-                "output_attentions", False
-            ):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            # elif self.config._attn_implementation == "flash_attention_2":
-            #     # Needed for CPU -> GPU
-            #     from surya.common.surya.flash_attn_utils import (
-            #         flash_attn_decode,
-            #         flash_attn_prefill,
-            #     )
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights = None
 
-            #     if prefill:
-            #         attention_interface = flash_attn_prefill
-            #     else:
-            #         attention_interface = flash_attn_decode
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[
-                    self.config._attn_implementation
-                ]
-
-        """
-        IMPORTANT:
-        We sometimes use a custom sliding window impl. during training
-
-        We force this to None to ensure that the HF attention integrations do not
-        perform any special handling - FA2 in particular will ignore the 4D mask, and use this instead
-        to infer the final mask
-
-        SDPA ignores this completely, and is fully dependent on the 4D mask - (https://github.com/huggingface/transformers/blob/b9faf2f93085e3cf2c65184a69d1d9e502f95786/src/transformers/integrations/sdpa_attention.py#L23)
-        """
-        sliding_window = None
-
-        attn_output, attn_weights = attention_interface(
-            self,
+        attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=sliding_window,  # main diff with Llama
-            # **kwargs,
+            attn_mask=attention_mask,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            scale=self.scaling,
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -288,23 +253,21 @@ class Qwen2CrossAttention(nn.Module):
         ):
             attention_mask = attention_mask[..., : query_states.shape[-2], :]
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get("sdpa")
-        if attention_interface is None:
-            raise RuntimeError(
-                "Scaled-dot product attention backend not available for cross attention"
-            )
 
-        attn_output, attn_weights = attention_interface(
-            self,
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights = None
+
+        attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=None,
-            **kwargs,
+            attn_mask=attention_mask,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            scale=self.scaling,
+            is_causal=False,
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
