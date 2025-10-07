@@ -1,4 +1,5 @@
 from typing import Callable, List, Optional, Tuple, Union
+import torch.nn.functional as F
 
 import torch
 from torch import nn
@@ -147,6 +148,7 @@ class Qwen2Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
         )
+        self.kv_cache = None
 
     def forward(
         self,
@@ -157,7 +159,6 @@ class Qwen2Attention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         cache_idxs: Optional[List[int]] = None,
         num_valid_tokens: Optional[List[int]] = None,
-        text_lengths: Optional[List[int]] = None,
         prefill: bool = False,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -173,70 +174,24 @@ class Qwen2Attention(nn.Module):
             query_states, key_states, cos, sin
         )
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            # cache_idxs, num_valid_tokens, and prefill add support for our new caching mechanism
-            cache_kwargs = {
-                "sin": sin,
-                "cos": cos,
-                "cache_position": cache_position,
-                "cache_idxs": cache_idxs,
-                "num_valid_tokens": num_valid_tokens,
-                "prefill": prefill,
-                "text_lengths": text_lengths,
-            }
-            key_states, value_states = past_key_value.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
+        if self.kv_cache is not None:
+            key_states, value_states = self.kv_cache.update(
+                cache_position, key_states, value_states, cache_idxs=cache_idxs
             )
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get(
-                "output_attentions", False
-            ):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            elif self.config._attn_implementation == "flash_attention_2":
-                # Needed for CPU -> GPU
-                from surya.common.surya.flash_attn_utils import (
-                    flash_attn_decode,
-                    flash_attn_prefill,
-                )
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        attn_weights = None
 
-                if prefill:
-                    attention_interface = flash_attn_prefill
-                else:
-                    attention_interface = flash_attn_decode
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[
-                    self.config._attn_implementation
-                ]
-
-        """
-        IMPORTANT:
-        We sometimes use a custom sliding window impl. during training
-
-        We force this to None to ensure that the HF attention integrations do not
-        perform any special handling - FA2 in particular will ignore the 4D mask, and use this instead
-        to infer the final mask
-
-        SDPA ignores this completely, and is fully dependent on the 4D mask - (https://github.com/huggingface/transformers/blob/b9faf2f93085e3cf2c65184a69d1d9e502f95786/src/transformers/integrations/sdpa_attention.py#L23)
-        """
-        sliding_window = None
-
-        attn_output, attn_weights = attention_interface(
-            self,
+        attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=sliding_window,  # main diff with Llama
-            **kwargs,
+            attn_mask=attention_mask,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            scale=self.scaling,
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -285,7 +240,6 @@ class Qwen2DecoderLayer(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         cache_idxs: Optional[List[int]] = None,
         num_valid_tokens: Optional[List[int]] = None,
-        text_lengths: Optional[List[int]] = None,
         prefill: bool = False,
         position_embeddings: Optional[
             Tuple[torch.Tensor, torch.Tensor]
@@ -310,7 +264,6 @@ class Qwen2DecoderLayer(nn.Module):
             position_embeddings=position_embeddings,
             cache_idxs=cache_idxs,
             num_valid_tokens=num_valid_tokens,
-            text_lengths=text_lengths,
             prefill=prefill,
             **kwargs,
         )
@@ -327,7 +280,6 @@ class Qwen2DecoderLayer(nn.Module):
             outputs += (self_attn_weights,)
 
         return outputs
-
 
 class Qwen2RotaryEmbedding(nn.Module):
     def __init__(self, config: SuryaDecoderConfig, device=None):
@@ -513,7 +465,6 @@ class SuryaDecoderModel(Qwen2PreTrainedModel):
                 cache_idxs=cache_idxs,
                 num_valid_tokens=num_valid_tokens,
                 prefill=prefill,
-                text_lengths=text_lengths,
                 **flash_attn_kwargs,
             )
 

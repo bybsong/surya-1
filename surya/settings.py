@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     FOUNDATION_MAX_TOKENS: Optional[int] = None
     FOUNDATION_CHUNK_SIZE: Optional[int] = None
     COMPILE_FOUNDATION: bool = False
+    # Compile only the tiny decoder step (single-token forward) during decode
+    # Keeps the rest of the model uncompiled for minimal surface area
+    FOUNDATION_COMPILE_DECODE: bool = False
     FOUNDATION_MULTI_TOKEN_MIN_CONFIDENCE: float = 0.9
 
     RECOGNITION_BATCH_SIZE: Optional[int] = (

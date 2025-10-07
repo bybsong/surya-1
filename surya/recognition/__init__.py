@@ -428,7 +428,7 @@ class RecognitionPredictor(BasePredictor):
         flat["task_names"] = [flat["task_names"][i] for i in indices]
 
         # Make predictions
-        predicted_tokens, batch_bboxes, scores, _ = self.foundation_predictor.prediction_loop(
+        predicted_tokens, batch_bboxes, scores, _ = self.foundation_predictor.prediction_loop_simple(
             images=flat["slices"],
             input_texts=flat["input_text"],
             task_names=flat["task_names"],

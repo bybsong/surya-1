@@ -1,6 +1,81 @@
+import torch.nn as nn
 from typing import Any, Dict, List, Optional, Tuple
 import torch
 from transformers import PretrainedConfig
+
+
+class EncoderOnlyCache:
+    """Lightweight container to persist encoder embeddings across steps.
+
+    Stores per-slot encoder embeddings and valid lengths in a dict keyed by
+    `cache_idx`. SuryaModel._get/_set_cached_encoder_states read/write
+    `._encoder_states` on this object.
+
+    `max_cache_len` is optional and only used by attention helpers when no
+    2D attention mask is provided.
+    """
+
+    def __init__(self, max_cache_len: Optional[int] = None):
+        self._encoder_states: Dict[int, Tuple[torch.Tensor, int]] = {}
+        self.max_cache_len: Optional[int] = max_cache_len
+
+
+
+class KVCache(nn.Module):
+    def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
+        super().__init__()
+        cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
+        self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
+
+    def update(
+        self,
+        input_pos: torch.LongTensor,
+        k_val: torch.Tensor,
+        v_val: torch.Tensor,
+        cache_idxs: Optional[List[int]] = None,
+    ):
+        # input_pos: [B, S], k_val/v_val: [B, H, S, D]
+        assert input_pos.ndim == 2, f"expected [B,S], got {tuple(input_pos.shape)}"
+        B, H, S, D = k_val.shape
+        assert self.k_cache.shape[1] == H, "head mismatch"
+        assert self.k_cache.shape[-1] == D, "head_dim mismatch"
+
+        # Build per-batch index for scatter on dim=2 (sequence length)
+        # index must match src shape and be long
+        index = input_pos.unsqueeze(1).unsqueeze(-1).expand(B, H, S, D).to(torch.long)
+
+        if cache_idxs is None:
+            # Expect exact batch size match
+            assert self.k_cache.shape[0] == B, (
+                f"batch mismatch, expected {self.k_cache.shape[0]}, got {B}"
+            )
+            self.k_cache.scatter_(dim=2, index=index, src=k_val)
+            self.v_cache.scatter_(dim=2, index=index, src=v_val)
+        else:
+            # Map current mini-batch rows into specified cache slots
+            cache_idxs_t = (
+                cache_idxs
+                if isinstance(cache_idxs, torch.Tensor)
+                else torch.tensor(cache_idxs, device=self.k_cache.device, dtype=torch.long)
+            )
+            cache_idxs_t = cache_idxs_t.to(device=self.k_cache.device, dtype=torch.long)
+            assert cache_idxs_t.numel() == B, (
+                f"cache_idxs length {cache_idxs_t.numel()} must equal batch {B}"
+            )
+
+            # Work on the selected rows, then write back
+            k_slice = self.k_cache.index_select(0, cache_idxs_t).contiguous()
+            v_slice = self.v_cache.index_select(0, cache_idxs_t).contiguous()
+
+            k_slice.scatter_(dim=2, index=index, src=k_val)
+            v_slice.scatter_(dim=2, index=index, src=v_val)
+
+            self.k_cache.index_copy_(0, cache_idxs_t, k_slice)
+            self.v_cache.index_copy_(0, cache_idxs_t, v_slice)
+
+        return self.k_cache, self.v_cache
+
 
 """
 Special cache class for the surya foundation model that supports - 

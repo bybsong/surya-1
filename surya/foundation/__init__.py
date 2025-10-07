@@ -21,14 +21,31 @@ from surya.foundation.util import (
     detect_repeat_token,
 )
 from surya.common.surya.schema import TaskNames
-from surya.foundation.cache import (
-    ContinuousBatchingCache,
-)
+from surya.foundation.cache import KVCache
+
 from surya.settings import settings
 from surya.logging import get_logger, configure_logging
 
 configure_logging()
 logger = get_logger()
+
+
+def _decode_step(
+    decoder,
+    inputs_embeds,
+    attention_mask,
+    position_ids,
+    cache_position,
+    cache_idxs,
+):
+    return decoder(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        cache_position=cache_position,
+        use_cache=True,
+        cache_idxs=cache_idxs,
+    )
 
 
 @dataclass
@@ -104,6 +121,15 @@ class FoundationPredictor(BasePredictor):
         self.prompt_queue = deque()
         self.batch_prompt_mapping = None
         self.kv_cache = None
+        self._compiled_decode_step = None
+        if settings.FOUNDATION_COMPILE_DECODE:
+            logger.debug("COMPILING DECODE STEP")
+            self._compiled_decode_step = torch.compile(
+                _decode_step
+            )
+        else:
+            logger.debug("NOT COMPILING DECODE STEP")
+            self._compiled_decode_step = _decode_step
 
         self.beacon_token_interval = self.model.config.beacon_token_interval
 
@@ -132,16 +158,16 @@ class FoundationPredictor(BasePredictor):
         return chunk_size
 
     def setup_cache(self, batch_size: int, max_cache_len: int, max_sliding_window: int):
-        self.kv_cache = ContinuousBatchingCache(
-            self.model.config,
-            batch_size,
-            max_cache_len,
-            text_sliding_window=max_sliding_window,
-            device=self.model.device,
-            dtype=self.model.dtype,
-        )
-        self.prompt_queue.clear()
-        self.batch_prompt_mapping = {i: None for i in range(batch_size)}
+        head_dim = self.model.config.hidden_size // self.model.config.num_attention_heads
+        with torch.device(self.model.device):
+            for layer in self.model.decoder.layers:
+                layer.self_attn.kv_cache = KVCache(
+                    batch_size,
+                    max_cache_len,
+                    self.model.config.num_key_value_heads,
+                    head_dim,
+                )
+        self.max_cache_len = max_cache_len
 
     @property
     def num_empty_slots(self):
@@ -300,30 +326,47 @@ class FoundationPredictor(BasePredictor):
         num_valid_tokens = current_inputs.num_valid_tokens
         batch_size = input_ids.shape[0]
 
-        # Pre-shift the attention mask based on the cache update
-        self.kv_cache.decode_attention_mask_update(
-            num_valid_tokens=num_valid_tokens, cache_idxs=list(range(batch_size))
-        )
+        cache_position = position_ids
+        attention_mask = torch.ones((batch_size, cache_position[0] + 1), device=input_ids.device)
 
-        cache_position = self.get_cache_position(
-            input_ids.shape[1], self.kv_cache.attention_mask, prefill=False
-        )
+        # Optional compile of a tiny decode step that only runs the decoder
+
         with settings.INFERENCE_MODE():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=self.kv_cache.attention_mask,
-                position_ids=position_ids,
-                cache_position=cache_position,
-                use_cache=True,
-                past_key_values=self.kv_cache,
-                prefill=False,
-                num_valid_tokens=num_valid_tokens,
-                logits_to_keep=1,
+            # Prepare embeddings and masks outside the compiled region
+            inputs_embeds = self.model.embed_ids_boxes_images(
+                input_ids, None, None, self.get_encoder_chunk_size()
             )
 
-        processed_output: ContinuousBatchOutput = self.process_outputs(
-            outputs, max_lookahead_tokens=max_lookahead_tokens
-        )
+            causal_mask = self.model._update_causal_mask(
+                attention_mask,
+                inputs_embeds,
+                cache_position,
+                None,
+                None,
+                target_length=self.max_cache_len,
+            )
+
+            attention_mask = causal_mask
+            outputs = self._compiled_decode_step(
+                self.model.decoder,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                cache_idxs=list(range(batch_size)),
+            )
+
+            hidden_states = outputs.last_hidden_state
+            if max_lookahead_tokens is not None:
+                hidden_states = hidden_states[:, -max_lookahead_tokens:, :]
+            hidden_states = hidden_states.contiguous()
+
+            lm_logits, bbox_logits = self.model.get_logits(hidden_states)
+
+            processed_output: ContinuousBatchOutput = self.process_outputs(
+                SuryaModelOutput(lm_logits=lm_logits, bbox_logits=bbox_logits),
+                max_lookahead_tokens=max_lookahead_tokens,
+            )
 
         input_ids = processed_output.input_ids
 
@@ -344,9 +387,9 @@ class FoundationPredictor(BasePredictor):
 
         num_predicted_tokens += num_new_tokens
 
-        input_ids, num_valid_tokens = self.maybe_insert_beacon_tokens(
-            input_ids, num_predicted_tokens, num_new_tokens
-        )
+        # input_ids, num_valid_tokens = self.maybe_insert_beacon_tokens(
+        #     input_ids, num_predicted_tokens, num_new_tokens
+        # )
         position_ids = position_ids[:, -1:] + torch.arange(
             1, input_ids.shape[1] + 1, device=input_ids.device
         )
@@ -523,10 +566,7 @@ class FoundationPredictor(BasePredictor):
             * predicted_tokens
         )
 
-        self.kv_cache.prefill_attention_mask_update(
-            attention_mask, idxs_to_merge, text_lengths[:valid_batch_size]
-        )
-        self.kv_cache.update_text_counts(idxs_to_merge, text_lengths[:valid_batch_size])
+        full_batch = len(idxs_to_merge) == self.kv_cache.max_batch_size
 
         if current_inputs is None:
             new_seq_len = processed_outputs.input_ids.shape[1]
@@ -809,4 +849,231 @@ class FoundationPredictor(BasePredictor):
         self.kv_cache = None
         torch.cuda.empty_cache()
 
+        return predicted_tokens, batch_bboxes, scores, topk_probs
+
+    def prediction_loop_simple(
+        self,
+        images: List[np.ndarray],
+        input_texts: List[str],
+        task_names: List[TaskNames],
+        batch_size: int | None = None,
+        max_tokens: int | None = None,
+        max_sliding_window: int | None = None,
+        math_mode: bool = True,
+        drop_repeated_tokens: bool = True,
+        max_lookahead_tokens: Optional[int] = 0,
+        top_k: int = 0,
+    ) -> tuple:
+        """
+        Simpler, fixed-batch loop: prefill once per batch, then decode with T=1 steps
+        until all sequences in the batch finish. No prompt queue or mid-run merges.
+
+        Returns the same structure as prediction_loop.
+        """
+        allowed_tasks = self.tasks.keys()
+        assert all([task_name in allowed_tasks for task_name in task_names]), (
+            f"One or more tasks in {task_names} is not supported. Supported tasks are {allowed_tasks}"
+        )
+
+        if batch_size is None:
+            batch_size = self.get_batch_size()
+
+        if max_sliding_window is None:
+            max_sliding_window = self.model.config.sliding_window
+
+        max_image_tokens = self.get_max_image_token_count(images, task_names)
+
+        # Per-image token limits and overall cap
+        per_img_max = {}
+        for idx, task in enumerate(task_names):
+            per_img_max[idx] = (
+                max_tokens
+                or settings.FOUNDATION_MAX_TOKENS
+                or self.tasks[task]["max_tokens"]
+            )
+        overall_max_tokens = max(per_img_max.values())
+
+        # Outputs aggregated across all images
+        N = len(images)
+        predicted_tokens: List[List[int]] = [[] for _ in range(N)]
+        scores: List[List[float]] = [[] for _ in range(N)]
+        topk_probs: List[List[dict]] = [[] for _ in range(N)]
+        batch_bboxes = torch.zeros(N, overall_max_tokens, 6)
+        batch_pos = [0] * N
+
+        # Iterate in fixed-size batches
+        idx = 0
+        pbar = tqdm(
+            total=N,
+            desc="Recognizing Text",
+            disable=self.disable_tqdm,
+        )
+        while idx < N:
+            end = min(idx + batch_size, N)
+            idxs = list(range(idx, end))
+            B = len(idxs)
+
+            # Reset caches for this batch
+            self.setup_cache(
+                B,
+                max_cache_len=max_sliding_window + max_image_tokens,
+                max_sliding_window=max_sliding_window,
+            )
+
+            # Build inputs for this batch
+            batch_input = self.prepare_input(
+                task_names=[task_names[i] for i in idxs],
+                images=[images[i] for i in idxs],
+                input_text=[input_texts[i] for i in idxs],
+                math_modes=[math_mode for _ in idxs],
+            )
+            processed = self.processor(
+                batch_input,
+                padding_side="left",
+                device=self.model.device,
+                pad_to_multiple=self.pad_to_multiple,
+            ).to(device=self.model.device)
+
+            input_ids = processed["input_ids"].to(dtype=torch.long)
+            image_tiles = processed["image_tiles"].to(dtype=self.model.dtype)
+            grid_thw = processed["grid_thw"].to(dtype=torch.long)
+            attention_mask = processed["attention_mask"].to(dtype=torch.long)
+            position_ids = processed["position_ids"].to(dtype=torch.long)
+
+            # Text lengths for encoder cache alignment
+            is_special = (input_ids.unsqueeze(-1) == self.special_token_ids).any(-1)
+            text_lengths = []
+            for i in range(input_ids.shape[0]):
+                special_positions = is_special[i].nonzero(as_tuple=True)[0]
+                if len(special_positions) > 0:
+                    prefix_len = special_positions[-1].item() + 1
+                else:
+                    prefix_len = 0
+                text_lengths.append(input_ids.shape[1] - prefix_len)
+
+            # Prefill once
+            cache_position = self.get_cache_position(
+                input_ids.shape[1], attention_mask, prefill=True
+            )
+            with settings.INFERENCE_MODE():
+                outputs = self.model(
+                    input_ids=input_ids,
+                    image_tiles=image_tiles,
+                    grid_thw=grid_thw,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    inputs_embeds=None,
+                    past_key_values=None,
+                    use_cache=True,
+                    encoder_chunk_size=self.get_encoder_chunk_size(),
+                    cache_idxs=list(range(B)),
+                    prefill=True,
+                    num_valid_tokens=None,
+                    text_lengths=text_lengths,
+                    logits_to_keep=1,
+                    max_cache_len=self.max_cache_len,
+                )
+
+            processed_outputs = self.process_outputs(
+                outputs, max_lookahead_tokens=max_lookahead_tokens
+            )
+
+            # Initialize next inputs for decode
+            new_seq_len = processed_outputs.input_ids.shape[1]
+            next_position_ids = position_ids[:, -1:] + torch.arange(
+                1, new_seq_len + 1, device=position_ids.device
+            )
+            num_valid_tokens = torch.ones((B), device=self.model.device, dtype=torch.long) * new_seq_len
+            num_predicted_tokens = (
+                torch.ones((B, 1), device=self.model.device, dtype=torch.long) * new_seq_len
+            )
+
+            current_inputs = ContinuousBatchInput(
+                input_ids=processed_outputs.input_ids,
+                position_ids=next_position_ids,
+                num_valid_tokens=num_valid_tokens,
+                num_predicted_tokens=num_predicted_tokens,
+            )
+
+            # Collect prefill outputs
+            preds_cpu = processed_outputs.preds.cpu()
+            scores_cpu = processed_outputs.scores.cpu()
+            if top_k > 0:
+                batch_top_k_probs, batch_top_k_indices = torch.topk(
+                    processed_outputs.token_probs, k=top_k, dim=-1
+                )
+                batch_top_k_probs_cpu = batch_top_k_probs.cpu()
+                batch_top_k_indices_cpu = batch_top_k_indices.cpu()
+
+            finished = [False] * B
+            for b_local in range(B):
+                g_idx = idxs[b_local]
+                token = preds_cpu[b_local, -1].item()
+                predicted_tokens[g_idx].append(token)
+                batch_bboxes[g_idx, batch_pos[g_idx]] = processed_outputs.bbox_preds[b_local, -1]
+                batch_pos[g_idx] += 1
+                scores[g_idx].append(scores_cpu[b_local, -1].item())
+                if top_k > 0:
+                    top_k_scores = {
+                        batch_top_k_indices_cpu[b_local, -1][k].item(): batch_top_k_probs_cpu[b_local, -1][k].item()
+                        for k in range(top_k)
+                    }
+                    topk_probs[g_idx].append(top_k_scores)
+
+                repeats = (
+                    len(predicted_tokens[g_idx]) >= per_img_max[g_idx]
+                    or (drop_repeated_tokens and detect_repeat_token(predicted_tokens[g_idx]))
+                )
+                if token in [self.processor.eos_token_id, self.processor.no_output_token, self.processor.pad_token_id] or repeats:
+                    finished[b_local] = True
+
+            # Decode loop (T=1)
+            while not all(finished):
+                updated_inputs, outputs = self.decode(current_inputs, max_lookahead_tokens=0)
+
+                preds_cpu = outputs.preds.cpu()
+                scores_cpu = outputs.scores.cpu()
+                if top_k > 0:
+                    batch_top_k_probs, batch_top_k_indices = torch.topk(
+                        outputs.token_probs, k=top_k, dim=-1
+                    )
+                    batch_top_k_probs_cpu = batch_top_k_probs.cpu()
+                    batch_top_k_indices_cpu = batch_top_k_indices.cpu()
+
+                for b_local in range(B):
+                    if finished[b_local]:
+                        continue
+                    g_idx = idxs[b_local]
+
+                    token = preds_cpu[b_local, -1].item()
+                    predicted_tokens[g_idx].append(token)
+                    batch_bboxes[g_idx, batch_pos[g_idx]] = outputs.bbox_preds[b_local, -1]
+                    batch_pos[g_idx] += 1
+                    scores[g_idx].append(scores_cpu[b_local, -1].item())
+                    if top_k > 0:
+                        top_k_scores = {
+                            batch_top_k_indices_cpu[b_local, -1][k].item(): batch_top_k_probs_cpu[b_local, -1][k].item()
+                            for k in range(top_k)
+                        }
+                        topk_probs[g_idx].append(top_k_scores)
+
+                    repeats = (
+                        len(predicted_tokens[g_idx]) >= per_img_max[g_idx]
+                        or (drop_repeated_tokens and detect_repeat_token(predicted_tokens[g_idx]))
+                    )
+                    if token in [self.processor.eos_token_id, self.processor.pad_token_id] or repeats:
+                        pbar.update(1)
+                        finished[b_local] = True
+
+                current_inputs = updated_inputs
+
+            # Release per-layer KV for this batch to reduce memory
+            for layer in self.model.decoder.layers:
+                layer.self_attn.kv_cache = None
+            torch.cuda.empty_cache()
+
+            idx = end
+
+        pbar.close()
         return predicted_tokens, batch_bboxes, scores, topk_probs
