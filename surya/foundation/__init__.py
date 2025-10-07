@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from collections import deque
+from functools import partial
 
 import cv2
 import numpy as np
@@ -25,9 +26,18 @@ from surya.foundation.cache import KVCache
 
 from surya.settings import settings
 from surya.logging import get_logger, configure_logging
+from torch.nn.attention.flex_attention import BlockMask, create_block_mask, or_masks, and_masks, create_mask
 
 configure_logging()
 logger = get_logger()
+
+torch._inductor.config.coordinate_descent_tuning = True
+torch._inductor.config.triton.unique_kernel_names = True
+# Experimental features to reduce compilation times, will be on by default in future
+torch._inductor.config.fx_graph_cache = True 
+torch._functorch.config.enable_autograd_cache = True
+
+create_block_mask = torch.compile(create_block_mask)
 
 
 def _decode_step(
@@ -48,10 +58,14 @@ def _decode_step(
     )
 
 
+def causal_mask(b, h, q, kv):
+    return (q >= kv)
+
 @dataclass
 class ContinuousBatchInput:
     input_ids: torch.Tensor
     position_ids: torch.Tensor
+    cache_position: torch.Tensor
     # input_ids and position_ids may be padded, num_valid_tokens tracks the 'real' counts
     num_valid_tokens: torch.Tensor
     # count the number of predicted tokens for each batch element so far
@@ -145,7 +159,8 @@ class FoundationPredictor(BasePredictor):
             device=self.model.device,
         )
 
-        self.pad_to_multiple = 512 if settings.FOUNDATION_STATIC_CACHE else None
+        # self.pad_to_multiple = 512 if settings.FOUNDATION_STATIC_CACHE else None
+        self.pad_to_multiple = 2
 
     def get_encoder_chunk_size(self) -> int:
         if settings.FOUNDATION_CHUNK_SIZE is not None:
@@ -312,10 +327,53 @@ class FoundationPredictor(BasePredictor):
 
         return new_input_ids, valid_token_counts
 
+    def get_decode_block_mask(self, block_mask, cache_position, prefix_start):
+        # NOTE: this function is entirely in logical space
+        # Use index-based access with symbolic indices (b,h,q,kv) to avoid
+        # materializing large broadcasted tensors inside mask_mod.
+        def causal_offset(off_abs: torch.Tensor, valid_start: torch.Tensor):
+            # off_abs: [B] absolute query start positions; valid_start: [B]
+            def offset(b, h, q_idx, kv_idx):
+                # q_idx and kv_idx are symbolic per-element indices provided by FlexAttention
+                q_abs = q_idx + off_abs[b]
+                return (q_abs >= kv_idx) & (kv_idx >= valid_start[b])
+
+            return offset
+
+        q_idx = (cache_position.squeeze(-1) // block_mask.BLOCK_SIZE[0]).clamp_(0, block_mask.kv_num_blocks.size(-1) - 1).to(torch.long)  # [B]
+        B, H, _ = block_mask.kv_num_blocks.shape
+        idx_bhq = q_idx[:, None, None].expand(-1, H, 1)  # [B, H, 1]
+        new_kv_num_blocks = torch.gather(block_mask.kv_num_blocks, dim=2, index=idx_bhq)  # [B, H, 1]
+        KV_CAP = block_mask.kv_indices.size(-1)
+        idx_bhqk = q_idx[:, None, None, None].expand(-1, H, 1, KV_CAP)  # [B, H, 1, KV_CAP]
+        new_kv_indices = torch.gather(block_mask.kv_indices, dim=2, index=idx_bhqk)  # [B, H, 1, KV_CAP]
+        if block_mask.full_kv_num_blocks is not None:
+            new_full_kv_num_blocks = torch.gather(block_mask.full_kv_num_blocks, dim=2, index=idx_bhq)  # [B, H, 1]
+            new_full_kv_indices = torch.gather(block_mask.full_kv_indices, dim=2, index=idx_bhqk)      # [B, H, 1, KV_CAP]
+        else:
+            new_full_kv_num_blocks = None
+            new_full_kv_indices = None
+
+        seq_length = (1, block_mask.seq_lengths[1])
+        # Absolute query position for this decode step per batch element (Q==1)
+        off_abs = cache_position.squeeze(-1).to(torch.long)  # [B]
+        mask = BlockMask.from_kv_blocks(
+            new_kv_num_blocks,
+            new_kv_indices,
+            new_full_kv_num_blocks,
+            new_full_kv_indices,
+            BLOCK_SIZE=block_mask.BLOCK_SIZE,
+            mask_mod=causal_offset(off_abs, prefix_start),
+            seq_lengths=seq_length,
+        )
+        return mask
+
     def decode(
         self,
         current_inputs: Optional[ContinuousBatchInput] = None,
         max_lookahead_tokens: Optional[int] = None,
+        block_mask: Optional[BlockMask] = None,
+        prefix_start: Optional[torch.Tensor] = None,
     ):
         # Note - If we want to use the outputs from the non-last token, we
         # need to set the cache position manually to ensure causality. The default
@@ -326,8 +384,9 @@ class FoundationPredictor(BasePredictor):
         num_valid_tokens = current_inputs.num_valid_tokens
         batch_size = input_ids.shape[0]
 
-        cache_position = position_ids
-        attention_mask = torch.ones((batch_size, cache_position[0] + 1), device=input_ids.device)
+        cache_position = current_inputs.cache_position
+
+        mask = self.get_decode_block_mask(block_mask, cache_position, prefix_start)
 
         # Optional compile of a tiny decode step that only runs the decoder
 
@@ -337,16 +396,7 @@ class FoundationPredictor(BasePredictor):
                 input_ids, None, None, self.get_encoder_chunk_size()
             )
 
-            causal_mask = self.model._update_causal_mask(
-                attention_mask,
-                inputs_embeds,
-                cache_position,
-                None,
-                None,
-                target_length=self.max_cache_len,
-            )
-
-            attention_mask = causal_mask
+            attention_mask = mask
             outputs = self._compiled_decode_step(
                 self.model.decoder,
                 inputs_embeds=inputs_embeds,
@@ -393,6 +443,9 @@ class FoundationPredictor(BasePredictor):
         position_ids = position_ids[:, -1:] + torch.arange(
             1, input_ids.shape[1] + 1, device=input_ids.device
         )
+        cache_position = cache_position[:, -1:] + torch.arange(
+            1, input_ids.shape[1] + 1, device=cache_position.device
+        )
         # Some of the input sequences may now have left padding tokens, so we want to account for that
         # offset is a per-batch offset of the position_ids
         offset = (input_ids.shape[1] - num_valid_tokens).unsqueeze(1)
@@ -403,6 +456,7 @@ class FoundationPredictor(BasePredictor):
             position_ids=position_ids,
             num_valid_tokens=num_valid_tokens,
             num_predicted_tokens=num_predicted_tokens,
+            cache_position=cache_position,
         )
 
         return new_input, processed_output
@@ -940,6 +994,26 @@ class FoundationPredictor(BasePredictor):
             attention_mask = processed["attention_mask"].to(dtype=torch.long)
             position_ids = processed["position_ids"].to(dtype=torch.long)
 
+            num_image_tokens = attention_mask.sum(dim=-1)
+            prefix_start = attention_mask.shape[1] - num_image_tokens
+
+            # inputs are left padded, so we need to create a mask that allows the prefix to be attended to
+            # attend to only the image tokens that are not pad tokens
+
+            def causal_mask_with_prefix(b, h, q, kv):
+                valid_start = prefix_start[b]
+                return (kv >= (valid_start)) & (q >= kv) & (q >= valid_start)
+
+
+            prefill_mask = create_block_mask(
+                causal_mask_with_prefix,
+                B,
+                1,
+                attention_mask.shape[1],
+                self.max_cache_len,
+                device=(self.model.device.type if isinstance(self.model.device, torch.device) else "cuda"),
+            )
+
             # Text lengths for encoder cache alignment
             is_special = (input_ids.unsqueeze(-1) == self.special_token_ids).any(-1)
             text_lengths = []
@@ -960,7 +1034,7 @@ class FoundationPredictor(BasePredictor):
                     input_ids=input_ids,
                     image_tiles=image_tiles,
                     grid_thw=grid_thw,
-                    attention_mask=attention_mask,
+                    attention_mask=prefill_mask,
                     position_ids=position_ids,
                     cache_position=cache_position,
                     inputs_embeds=None,
@@ -988,12 +1062,16 @@ class FoundationPredictor(BasePredictor):
             num_predicted_tokens = (
                 torch.ones((B, 1), device=self.model.device, dtype=torch.long) * new_seq_len
             )
+            next_cache_position = cache_position[:, -1:] + torch.arange(
+                1, new_seq_len + 1, device=cache_position.device
+            )
 
             current_inputs = ContinuousBatchInput(
                 input_ids=processed_outputs.input_ids,
                 position_ids=next_position_ids,
                 num_valid_tokens=num_valid_tokens,
                 num_predicted_tokens=num_predicted_tokens,
+                cache_position=next_cache_position,
             )
 
             # Collect prefill outputs
@@ -1029,8 +1107,25 @@ class FoundationPredictor(BasePredictor):
                     finished[b_local] = True
 
             # Decode loop (T=1)
+            # Build a single reusable static causal BlockMask for this batch
+            device_str = (
+                self.model.device.type if isinstance(self.model.device, torch.device) else "cuda"
+            )
+            decode_block_mask = create_block_mask(
+                causal_mask,
+                B,
+                1,
+                self.max_cache_len,
+                self.max_cache_len,
+                device=device_str,
+            )
             while not all(finished):
-                updated_inputs, outputs = self.decode(current_inputs, max_lookahead_tokens=0)
+                updated_inputs, outputs = self.decode(
+                    current_inputs,
+                    max_lookahead_tokens=0,
+                    block_mask=decode_block_mask,
+                    prefix_start=prefix_start,
+                )
 
                 preds_cpu = outputs.preds.cpu()
                 scores_cpu = outputs.scores.cpu()
@@ -1072,6 +1167,8 @@ class FoundationPredictor(BasePredictor):
             for layer in self.model.decoder.layers:
                 layer.self_attn.kv_cache = None
             torch.cuda.empty_cache()
+
+            # No per-batch decode mask state to clear
 
             idx = end
 

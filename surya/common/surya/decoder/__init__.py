@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch
 from torch import nn
 
+from torch.nn.attention.flex_attention import flex_attention, BlockMask
 from transformers.activations import ACT2FN
 from transformers.cache_utils import (
     Cache,
@@ -179,21 +180,28 @@ class Qwen2Attention(nn.Module):
                 cache_position, key_states, value_states, cache_idxs=cache_idxs
             )
 
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        # key_states = repeat_kv(key_states, self.num_key_value_groups)
+        # value_states = repeat_kv(value_states, self.num_key_value_groups)
         attn_weights = None
 
-        attn_output = F.scaled_dot_product_attention(
+        # attn_output = F.scaled_dot_product_attention(
+        #     query_states,
+        #     key_states,
+        #     value_states,
+        #     attn_mask=attention_mask,
+        #     dropout_p=0.0 if not self.training else self.attention_dropout,
+        #     scale=self.scaling,
+        # )
+        attn_output = flex_attention(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
-            dropout_p=0.0 if not self.training else self.attention_dropout,
-            scale=self.scaling,
+            block_mask=attention_mask,
+            enable_gqa=(self.num_key_value_groups != self.config.num_attention_heads),
         )
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.transpose(1, 2)
 
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1)
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 

@@ -412,30 +412,30 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
 
         # Handling flash attention kwargs outside the decoder to speed up + avoid graph breaks inside the decoder
         # Skipped during decoding since not required
-        if self.decoder.config._attn_implementation == "flash_attention_2" and prefill:
-            # Needed for CPU -> GPU
-            from surya.common.surya.flash_attn_utils import _get_unpad_data
+        # if self.decoder.config._attn_implementation == "flash_attention_2" and prefill:
+        #     # Needed for CPU -> GPU
+        #     from surya.common.surya.flash_attn_utils import _get_unpad_data
 
-            batch_size, query_length, _ = inputs_embeds.shape
-            indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(
-                attention_mask
-            )
-            kwargs["batch_size"] = batch_size
-            kwargs["query_length"] = query_length
-            kwargs["indices_k"] = indices_k
-            kwargs["cu_seqlens_k"] = cu_seqlens_k
-            kwargs["max_seqlen_in_batch_k"] = max_seqlen_in_batch_k
+        #     batch_size, query_length, _ = inputs_embeds.shape
+        #     indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(
+        #         attention_mask
+        #     )
+        #     kwargs["batch_size"] = batch_size
+        #     kwargs["query_length"] = query_length
+        #     kwargs["indices_k"] = indices_k
+        #     kwargs["cu_seqlens_k"] = cu_seqlens_k
+        #     kwargs["max_seqlen_in_batch_k"] = max_seqlen_in_batch_k
 
-        causal_mask = self._update_causal_mask(
-            attention_mask,
-            inputs_embeds,
-            cache_position,
-            past_key_values,
-            output_attentions,
-            max_cache_len,
-        )
+        # causal_mask = self._update_causal_mask(
+        #     attention_mask,
+        #     inputs_embeds,
+        #     cache_position,
+        #     past_key_values,
+        #     output_attentions,
+        #     max_cache_len,
+        # )
 
-        attention_mask = causal_mask
+        # attention_mask = causal_mask
         outputs = self.decoder(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
