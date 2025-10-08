@@ -261,10 +261,8 @@ class FoundationPredictor(BasePredictor):
             token_probs=token_probs,
         )
 
-    # Make space for beacon tokens to be inserted while keeping the same seq len across all batch elements
-    # This involves **left padding** the input sequence. Although this is unconventional, it works better
-    # with the causal mask of flash attention, and we are careful to ignore this pad token when inserting
-    # into cache
+    # Make space for beacon tokens to be inserted while keeping the same seq len across all batch elements.
+    # Uses right padding semantics elsewhere; this helper is currently unused.
     def maybe_insert_beacon_tokens(
         self,
         input_ids: torch.Tensor,
@@ -327,17 +325,21 @@ class FoundationPredictor(BasePredictor):
 
         return new_input_ids, valid_token_counts
 
-    def get_decode_block_mask(self, block_mask, cache_position, prefix_start):
+    def get_decode_block_mask(self, block_mask, cache_position):
         # NOTE: this function is entirely in logical space
         # Use index-based access with symbolic indices (b,h,q,kv) to avoid
         # materializing large broadcasted tensors inside mask_mod.
-        def causal_offset(off_abs: torch.Tensor, valid_start: torch.Tensor):
-            # off_abs: [B] absolute query start positions; valid_start: [B]
+        # Right-padding semantics:
+        #  - prefill may have cached pad tokens in [valid_len[b], prefill_T[b]-1]
+        #  - the first decode token index is off_abs[b] (== prefill_T[b])
+        #  - allow kv if kv < valid_len[b] OR kv >= off_abs[b]
+        #  - always maintain causality: kv <= q_abs
+        def causal_offset(off_abs: torch.Tensor):
+            # off_abs: [B] absolute query start positions (for this step)
+            # Fallback: pure causal, no pad-gap exclusion
             def offset(b, h, q_idx, kv_idx):
-                # q_idx and kv_idx are symbolic per-element indices provided by FlexAttention
                 q_abs = q_idx + off_abs[b]
-                return (q_abs >= kv_idx) & (kv_idx >= valid_start[b])
-
+                return (q_abs >= kv_idx)
             return offset
 
         q_idx = (cache_position.squeeze(-1) // block_mask.BLOCK_SIZE[0]).clamp_(0, block_mask.kv_num_blocks.size(-1) - 1).to(torch.long)  # [B]
@@ -363,7 +365,7 @@ class FoundationPredictor(BasePredictor):
             new_full_kv_num_blocks,
             new_full_kv_indices,
             BLOCK_SIZE=block_mask.BLOCK_SIZE,
-            mask_mod=causal_offset(off_abs, prefix_start),
+            mask_mod=causal_offset(off_abs),
             seq_lengths=seq_length,
         )
         return mask
@@ -373,7 +375,6 @@ class FoundationPredictor(BasePredictor):
         current_inputs: Optional[ContinuousBatchInput] = None,
         max_lookahead_tokens: Optional[int] = None,
         block_mask: Optional[BlockMask] = None,
-        prefix_start: Optional[torch.Tensor] = None,
     ):
         # Note - If we want to use the outputs from the non-last token, we
         # need to set the cache position manually to ensure causality. The default
@@ -386,7 +387,7 @@ class FoundationPredictor(BasePredictor):
 
         cache_position = current_inputs.cache_position
 
-        mask = self.get_decode_block_mask(block_mask, cache_position, prefix_start)
+        mask = self.get_decode_block_mask(block_mask, cache_position)
 
         # Optional compile of a tiny decode step that only runs the decoder
 
@@ -446,10 +447,6 @@ class FoundationPredictor(BasePredictor):
         cache_position = cache_position[:, -1:] + torch.arange(
             1, input_ids.shape[1] + 1, device=cache_position.device
         )
-        # Some of the input sequences may now have left padding tokens, so we want to account for that
-        # offset is a per-batch offset of the position_ids
-        offset = (input_ids.shape[1] - num_valid_tokens).unsqueeze(1)
-        position_ids -= offset
 
         new_input = ContinuousBatchInput(
             input_ids=input_ids,
@@ -468,8 +465,8 @@ class FoundationPredictor(BasePredictor):
         new_seq_len: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Pads new_input_ids to match the new seq len with **left padding**
-        and creates updated position_ids
+        Pads input_ids to match new_seq_len with right padding
+        and creates updated position_ids (monotonic, no offset corrections).
 
         Returns:
             padded_input_ids (torch.Tensor): [batch_size, current_seq_len]
@@ -483,16 +480,13 @@ class FoundationPredictor(BasePredictor):
 
         pad_len = new_seq_len - input_ids.shape[1]
         padded_input_ids = torch.nn.functional.pad(
-            input_ids, (pad_len, 0), value=self.device_pad_token
+            input_ids, (0, pad_len), value=self.device_pad_token
         )
 
-        # Since we have **left padding**, offset the new position_ids by the amount of padding
-        # This ensures that the **true tokens** get the correct position_ids
-        # The position_ids assigned to pad tokens do not matter. They are not cached, and not used for outputs
+        # Right padding only: position ids continue monotonically
         updated_position_ids = position_ids[:, -1:] + torch.arange(
             1, new_seq_len + 1, device=self.model.device
         )
-        updated_position_ids -= pad_len
 
         return padded_input_ids, updated_position_ids
 
@@ -544,7 +538,7 @@ class FoundationPredictor(BasePredictor):
         )
         processed_inputs = self.processor(
             batch_input,
-            padding_side="left",
+            padding_side="right",
             device=self.model.device,
             pad_to_multiple=self.pad_to_multiple,
         ).to(device=self.model.device)
@@ -567,7 +561,7 @@ class FoundationPredictor(BasePredictor):
                 position_ids, batch_size=self.kv_cache.max_batch_size
             )
 
-        # Find text lengths of each
+        # Find text lengths of each (image prefix vs. text)
         is_special = (input_ids.unsqueeze(-1) == self.special_token_ids).any(
             -1
         )  # (batch, seq_len)
@@ -581,15 +575,33 @@ class FoundationPredictor(BasePredictor):
                 prefix_len = 0
             text_lengths.append(input_ids.shape[1] - prefix_len)
 
+        # Right padding valid lengths for the active rows
+        valid_len = attention_mask.sum(dim=-1).to(torch.long)
+
         cache_position = self.get_cache_position(
             input_ids.shape[1], attention_mask, prefill=True
         )
         with settings.INFERENCE_MODE():
+            # Build prefill block mask (right padding, per-sample valid_len)
+            def causal_mask_with_valid_len(_valid_len: torch.Tensor):
+                def _fn(b, h, q, kv):
+                    return (q < _valid_len[b]) & (kv < _valid_len[b]) & (q >= kv)
+                return _fn
+
+            prefill_mask = create_block_mask(
+                causal_mask_with_valid_len(valid_len),
+                input_ids.shape[0],
+                1,
+                input_ids.shape[1],
+                self.max_cache_len,
+                device=(self.model.device.type if isinstance(self.model.device, torch.device) else "cuda"),
+            )
+
             outputs = self.model(
                 input_ids=input_ids,
                 image_tiles=image_tiles,
                 grid_thw=grid_thw,
-                attention_mask=attention_mask,
+                attention_mask=prefill_mask,
                 position_ids=position_ids,
                 cache_position=cache_position,
                 inputs_embeds=None,
@@ -825,7 +837,8 @@ class FoundationPredictor(BasePredictor):
                                 break
             else:
                 updated_inputs, outputs = self.decode(
-                    current_inputs, max_lookahead_tokens=max_lookahead_tokens
+                    current_inputs,
+                    max_lookahead_tokens=max_lookahead_tokens,
                 )
                 predicted_tokens_cpu = outputs.preds.cpu()
                 scores_cpu = outputs.scores.cpu()
@@ -983,7 +996,7 @@ class FoundationPredictor(BasePredictor):
             )
             processed = self.processor(
                 batch_input,
-                padding_side="left",
+                padding_side="right",
                 device=self.model.device,
                 pad_to_multiple=self.pad_to_multiple,
             ).to(device=self.model.device)
@@ -994,19 +1007,18 @@ class FoundationPredictor(BasePredictor):
             attention_mask = processed["attention_mask"].to(dtype=torch.long)
             position_ids = processed["position_ids"].to(dtype=torch.long)
 
-            num_image_tokens = attention_mask.sum(dim=-1)
-            prefix_start = attention_mask.shape[1] - num_image_tokens
+            # Right padding: valid lengths are just the sum of attention_mask
+            valid_len = attention_mask.sum(dim=-1).to(torch.long)  # [B]
 
-            # inputs are left padded, so we need to create a mask that allows the prefix to be attended to
-            # attend to only the image tokens that are not pad tokens
-
-            def causal_mask_with_prefix(b, h, q, kv):
-                valid_start = prefix_start[b]
-                return (kv >= (valid_start)) & (q >= kv) & (q >= valid_start)
+            # Build a causal mask limited to valid_len per sample
+            def causal_mask_with_valid_len(_valid_len: torch.Tensor):
+                def _fn(b, h, q, kv):
+                    return (q < _valid_len[b]) & (kv < _valid_len[b]) & (q >= kv)
+                return _fn
 
 
             prefill_mask = create_block_mask(
-                causal_mask_with_prefix,
+                causal_mask_with_valid_len(valid_len),
                 B,
                 1,
                 attention_mask.shape[1],
@@ -1026,9 +1038,12 @@ class FoundationPredictor(BasePredictor):
                 text_lengths.append(input_ids.shape[1] - prefix_len)
 
             # Prefill once
-            cache_position = self.get_cache_position(
-                input_ids.shape[1], attention_mask, prefill=True
-            )
+            # cache_position = self.get_cache_position(
+            #     input_ids.shape[1], attention_mask, prefill=True
+            # )
+            cache_position = (attention_mask.cumsum(dim=1) - 1).to(torch.long)
+            # set max cache len for padding tokens, will get overwritten later
+            cache_position = torch.where(attention_mask == 1, cache_position, self.max_cache_len - 1)
             with settings.INFERENCE_MODE():
                 outputs = self.model(
                     input_ids=input_ids,
@@ -1055,14 +1070,14 @@ class FoundationPredictor(BasePredictor):
 
             # Initialize next inputs for decode
             new_seq_len = processed_outputs.input_ids.shape[1]
-            next_position_ids = position_ids[:, -1:] + torch.arange(
+            next_position_ids = attention_mask.sum(dim=1).unsqueeze(1) + torch.arange(
                 1, new_seq_len + 1, device=position_ids.device
             )
             num_valid_tokens = torch.ones((B), device=self.model.device, dtype=torch.long) * new_seq_len
             num_predicted_tokens = (
                 torch.ones((B, 1), device=self.model.device, dtype=torch.long) * new_seq_len
             )
-            next_cache_position = cache_position[:, -1:] + torch.arange(
+            next_cache_position =  attention_mask.sum(dim=1).unsqueeze(1) + torch.arange(
                 1, new_seq_len + 1, device=cache_position.device
             )
 
@@ -1124,7 +1139,6 @@ class FoundationPredictor(BasePredictor):
                     current_inputs,
                     max_lookahead_tokens=0,
                     block_mask=decode_block_mask,
-                    prefix_start=prefix_start,
                 )
 
                 preds_cpu = outputs.preds.cpu()
