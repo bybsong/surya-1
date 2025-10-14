@@ -143,6 +143,7 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
         # Tying configs
         self.vision_encoder.config = self.config.vision_encoder
         self.decoder.config = self.config.decoder
+        self.vision_projector = nn.Linear(config.vision_encoder.hidden_size, config.hidden_size)
 
         self.bbox_head = BboxHead(config.hidden_size, 6)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size)
@@ -256,8 +257,8 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
             )
 
             chunk_embeddings = self.vision_encoder.embed_images(
-                image_batch=chunk_pixels.unsqueeze(0).to(device=self.device),
-                grid_thw=chunk_grid_thw.unsqueeze(0).to(device=self.device),
+                image_batch=chunk_pixels.to(device=self.device),
+                grid_thw=chunk_grid_thw.to(device=self.device),
             )
             embeddings.append(chunk_embeddings[:valid_embed_len].squeeze(0))
 
@@ -269,6 +270,8 @@ class SuryaModel(S3DownloaderMixin, SuryaPreTrainedModel):
             embeddings = embeddings[0]
         else:
             embeddings = torch.cat(embeddings, dim=0)
+
+        embeddings = self.vision_projector(embeddings)
 
         encoding_2d = self.get_2d_learned_embeddings(
             grid_thw,
