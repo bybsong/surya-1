@@ -1,0 +1,66 @@
+# Docker Compose for Surya OCR - PHASE 1: MODEL DOWNLOAD
+# This file enables network access for downloading models
+# Use this ONCE to download models, then switch to docker-compose.yml for airgapped operation
+
+version: '3.8'
+
+services:
+  surya-ocr-download:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: surya-ocr:0.17.0
+    container_name: surya-ocr-download
+    volumes:
+      # Mount models cache - these volumes persist after container stops
+      - surya_models:/root/.cache/datalab/models
+      - surya_huggingface:/root/.cache/huggingface
+    environment:
+      # GPU settings
+      - TORCH_DEVICE=cuda
+      - CUDA_VISIBLE_DEVICES=0
+      
+      # IMPORTANT: Enable network access for model downloads
+      - HUGGINGFACE_HUB_DISABLE_TELEMETRY=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - HF_HUB_OFFLINE=0
+      - TRANSFORMERS_OFFLINE=0
+      - HF_DATASETS_OFFLINE=0
+      - DISABLE_MLFLOW_INTEGRATION=true
+      
+      # Use default batch sizes during download (less memory needed)
+      - DETECTOR_BATCH_SIZE=4
+      - RECOGNITION_BATCH_SIZE=32
+      - LAYOUT_BATCH_SIZE=4
+      - TABLE_REC_BATCH_SIZE=8
+      
+      # Logging
+      - LOGLEVEL=INFO
+      
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    # This container has network access for downloads
+    networks:
+      - download_network
+    
+    # Override entrypoint to run download script directly
+    entrypoint: ["python", "/app/download-models.py"]
+
+volumes:
+  surya_models:
+    driver: local
+  surya_huggingface:
+    driver: local
+
+networks:
+  download_network:
+    driver: bridge
+
+
+

@@ -1,0 +1,92 @@
+# Docker Compose for Surya OCR v0.17.0
+# Two-phase deployment: 
+#   Phase 1: Use docker-compose-download.yml to download models WITH network
+#   Phase 2: Use this file for airgapped production with llamaindex_internal network
+
+version: '3.8'
+
+services:
+  surya-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: surya-ocr:0.17.0
+    container_name: surya-ocr
+    ports:
+      - "8501:8501"  # Streamlit app
+      - "8080:8080"  # FastAPI REST API
+      - "7860:7860"  # Gradio port
+    volumes:
+      # Mount input/output directories
+      - ./data:/app/data
+      - ./results:/app/results
+      # Mount Windows output directory for API results
+      - /mnt/c/Users/bybso/Sync/PMHx/SuryaOut:/app/surya-output
+      # Mount models cache to persist downloads (CRITICAL for airgap)
+      - surya_models:/root/.cache/datalab/models
+      - surya_huggingface:/root/.cache/huggingface
+    environment:
+      # GPU and CUDA settings
+      - TORCH_DEVICE=cuda
+      - CUDA_VISIBLE_DEVICES=0
+      
+      # CRITICAL: Airgap security settings - block all network access
+      - HUGGINGFACE_HUB_DISABLE_TELEMETRY=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+      - DISABLE_MLFLOW_INTEGRATION=true
+      
+      # Surya specific settings optimized for RTX 5090 (32GB VRAM)
+      - DETECTOR_BATCH_SIZE=64
+      - RECOGNITION_BATCH_SIZE=1024
+      - LAYOUT_BATCH_SIZE=64
+      - TABLE_REC_BATCH_SIZE=128
+      - OCR_ERROR_BATCH_SIZE=64
+      
+      # Compilation settings for better performance
+      - COMPILE_ALL=true
+      - COMPILE_DETECTOR=true
+      - COMPILE_LAYOUT=true
+      - COMPILE_TABLE_REC=true
+      - COMPILE_FOUNDATION=true
+      - COMPILE_OCR_ERROR=true
+      
+      # Logging
+      - LOGLEVEL=INFO
+      - DISABLE_TQDM=false
+      
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import torch; assert torch.cuda.is_available(), 'CUDA not available'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    
+    # AIRGAP: Connect ONLY to internal network - NO internet access
+    networks:
+      - llamaindex_internal
+
+volumes:
+  surya_models:
+    driver: local
+  surya_huggingface:
+    driver: local
+
+# Use external llamaindex_internal network for airgapping
+networks:
+  llamaindex_internal:
+    external: true
+    name: llamaindex_internal
+
+
+
